@@ -262,6 +262,7 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
   complex(8),allocatable,save :: gemm_wf_packed(:,:,:), gemm_out_packed(:,:,:)
   type(cublasHandle),save :: gemm_handle
   logical,save :: gemm_handle_created = .false.
+  logical,save :: gemm_debug_printed = .false.
   integer :: gemm_ia, gemm_p, gemm_ilma, gemm_j, gemm_natom
   integer :: gemm_io_blk_s, gemm_this_block, gemm_io_local, gemm_stat
 #endif
@@ -571,6 +572,31 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
     end do
     end do
     end do
+
+    ! TEMPORARY DIAGNOSTIC -- remove before merging. Compare the GEMM's
+    ! actual uVpsibox(1,...) / uVpsibox(2,...) (atom 1's first two
+    ! projectors, first orbital/spin/k/im) against a plain host-side
+    ! reference computed directly from tpsi/zekr_uV/jxyz, mirroring the
+    ! original reduction algorithm exactly.
+    if (.not. gemm_debug_printed) then
+      gemm_debug_printed = .true.
+      uVpsi = 0.d0
+      do j=1,ppg%mps(1)
+        ix = ppg%jxyz(1,j,1); iy = ppg%jxyz(2,j,1); iz = ppg%jxyz(3,j,1)
+        uVpsi = uVpsi + conjg(ppg%zekr_uV(j,1,ik_s)) * tpsi%zwf(ix,iy,iz,1,io_s,ik_s,im_s)
+      end do
+      uVpsi = uVpsi * ppg%rinv_uvu(1)
+      write(*,'(A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG uVpsibox(ilma=1) gemm=',ppg%uVpsibox(1,1,io_s,ik_s,im_s), &
+          ' ref=',uVpsi
+      uVpsi = 0.d0
+      do j=1,ppg%mps(1)
+        ix = ppg%jxyz(1,j,1); iy = ppg%jxyz(2,j,1); iz = ppg%jxyz(3,j,1)
+        uVpsi = uVpsi + conjg(ppg%zekr_uV(j,2,ik_s)) * tpsi%zwf(ix,iy,iz,1,io_s,ik_s,im_s)
+      end do
+      uVpsi = uVpsi * ppg%rinv_uvu(2)
+      write(*,'(A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG uVpsibox(ilma=2) gemm=',ppg%uVpsibox(2,1,io_s,ik_s,im_s), &
+          ' ref=',uVpsi
+    end if
 
     ! Phase 2 (back-projection): completely unchanged from the plain-acc
     ! path below -- same atomic-free inverse-gather-map algorithm, own

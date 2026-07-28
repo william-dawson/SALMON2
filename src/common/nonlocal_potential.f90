@@ -659,6 +659,21 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
         write(*,'(A,I0,A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG block2 io=',gemm_j,' gemm=', &
             ppg%uVpsibox(1,1,gemm_j,ik_s,im_s),' ref=',uVpsi
       end if
+
+      ! Everything so far falls in a FULL-width band block (io_s is block 1,
+      ! io_s+gemm_io_block is block 2, both size gemm_io_block). If
+      ! (io_e-io_s+1) isn't a multiple of gemm_io_block, the LAST block is
+      ! partial (this_block < gemm_io_block) -- untested until now. Check
+      ! the very last band (io_e), atom 1/ilma=1.
+      write(*,'(A,I0,A,I0)') 'GEMM_DEBUG nstate=',io_e-io_s+1,' io_block=',gemm_io_block
+      uVpsi = 0.d0
+      do j=1,ppg%mps(1)
+        ix = ppg%jxyz(1,j,1); iy = ppg%jxyz(2,j,1); iz = ppg%jxyz(3,j,1)
+        uVpsi = uVpsi + conjg(ppg%zekr_uV(j,1,ik_s)) * tpsi%zwf(ix,iy,iz,1,io_e,ik_s,im_s)
+      end do
+      uVpsi = uVpsi * ppg%rinv_uvu(1)
+      write(*,'(A,I0,A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG lastblock io=',io_e,' gemm=', &
+          ppg%uVpsibox(1,1,io_e,ik_s,im_s),' ref=',uVpsi
     end if
 
     ! Phase 2 (back-projection): completely unchanged from the plain-acc

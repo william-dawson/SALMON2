@@ -257,7 +257,7 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
   integer, parameter :: gemm_io_block = 64
   integer,save :: gemm_max_nproj = -1
   integer,allocatable,save :: gemm_nproj_atom(:), gemm_l2g(:,:)
-  complex(8),allocatable,save :: gemm_zekr_packed(:,:,:,:)
+  complex(8),allocatable,save :: gemm_zekr_packed(:,:,:)
   real(8),allocatable,save :: gemm_rinv_packed(:,:)
   complex(8),allocatable,save :: gemm_wf_packed(:,:,:), gemm_out_packed(:,:,:)
   type(cublasHandle),save :: gemm_handle
@@ -460,19 +460,23 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
       ! Zero-init THEN fill only the valid (j<=mps(ia), p<=nproj_atom(ia))
       ! region -- ppg%zekr_uV's own out-of-range rows are uninitialized
       ! (see header comment), so we deliberately never read them here.
-      allocate(gemm_zekr_packed(ppg%nps, gemm_max_nproj, gemm_natom, ik_s:ik_e))
+      ! No ik dimension here (unlike ppg%zekr_uV itself): this prototype
+      ! assumes a single k-point (ik_s=ik_e), matching every real-SALMON
+      ! test this session -- keeps gemm_zekr_packed a plain 3D array
+      ! passed whole (not sliced) to cublas, avoiding an array-section
+      ! host_data/cublas interaction pattern that triggered an nvfortran
+      ! internal compiler error when this was (nps,max_nproj,natom,ik).
+      allocate(gemm_zekr_packed(ppg%nps, gemm_max_nproj, gemm_natom))
       allocate(gemm_rinv_packed(gemm_max_nproj, gemm_natom))
       gemm_zekr_packed = (0.d0,0.d0)
       gemm_rinv_packed = 0.d0
-      do ik=ik_s,ik_e
       do gemm_ia=1,gemm_natom
       do gemm_p=1,gemm_nproj_atom(gemm_ia)
         gemm_ilma = gemm_l2g(gemm_p, gemm_ia)
         do gemm_j=1,ppg%mps(gemm_ia)
-          gemm_zekr_packed(gemm_j, gemm_p, gemm_ia, ik) = ppg%zekr_uV(gemm_j, gemm_ilma, ik)
+          gemm_zekr_packed(gemm_j, gemm_p, gemm_ia) = ppg%zekr_uV(gemm_j, gemm_ilma, ik_s)
         end do
         gemm_rinv_packed(gemm_p, gemm_ia) = ppg%rinv_uvu(gemm_ilma)
-      end do
       end do
       end do
 !$acc enter data copyin(gemm_zekr_packed, gemm_rinv_packed, gemm_l2g, gemm_nproj_atom)
@@ -499,18 +503,24 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
       do while (gemm_io_blk_s <= io_e)
         gemm_this_block = min(gemm_io_block, io_e - gemm_io_blk_s + 1)
 
-        ! Gather: only the valid (j<=mps(ia)) region is touched, matching
-        ! the ONLY safe read range of ppg%jxyz (reading beyond mps(ia)
-        ! would be an out-of-bounds array-index use, not just a wrong
-        ! answer -- see header comment). Padding stays the zero it was
-        ! copied in as above.
+        ! Gather: loop bound must be invariant (ppg%nps, the same for
+        ! every atom) for collapse(3) to be legal -- OpenACC requires a
+        ! rectangular iteration space, but ppg%mps(gemm_ia) is ragged
+        ! (varies per atom). Guard with an if instead: only the valid
+        ! (j<=mps(ia)) region is touched, matching the ONLY safe read
+        ! range of ppg%jxyz (reading beyond mps(ia) would be an
+        ! out-of-bounds array-index use, not just a wrong answer -- see
+        ! header comment). Padding stays the zero it was copied in as
+        ! above (the loop simply skips writing to it here).
 !$acc parallel loop collapse(3) present(tpsi,ppg,gemm_wf_packed)
         do gemm_ia = 1, gemm_natom
         do gemm_io_local = 1, gemm_this_block
-        do gemm_j = 1, ppg%mps(gemm_ia)
-          gemm_wf_packed(gemm_j, gemm_io_local, gemm_ia) = tpsi%zwf( &
-              ppg%jxyz(1,gemm_j,gemm_ia), ppg%jxyz(2,gemm_j,gemm_ia), ppg%jxyz(3,gemm_j,gemm_ia), &
-              ispin, gemm_io_blk_s+gemm_io_local-1, ik, im)
+        do gemm_j = 1, ppg%nps
+          if (gemm_j <= ppg%mps(gemm_ia)) then
+            gemm_wf_packed(gemm_j, gemm_io_local, gemm_ia) = tpsi%zwf( &
+                ppg%jxyz(1,gemm_j,gemm_ia), ppg%jxyz(2,gemm_j,gemm_ia), ppg%jxyz(3,gemm_j,gemm_ia), &
+                ispin, gemm_io_blk_s+gemm_io_local-1, ik, im)
+          end if
         end do
         end do
         end do
@@ -520,7 +530,7 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
 !$acc host_data use_device(gemm_zekr_packed, gemm_wf_packed, gemm_out_packed)
         gemm_stat = cublasZgemmStridedBatched(gemm_handle, CUBLAS_OP_C, CUBLAS_OP_N, &
             gemm_max_nproj, gemm_this_block, ppg%nps, &
-            (1.d0,0.d0), gemm_zekr_packed(:,:,:,ik), ppg%nps, int(ppg%nps,8)*int(gemm_max_nproj,8), &
+            (1.d0,0.d0), gemm_zekr_packed, ppg%nps, int(ppg%nps,8)*int(gemm_max_nproj,8), &
             gemm_wf_packed, ppg%nps, int(ppg%nps,8)*int(gemm_io_block,8), &
             (0.d0,0.d0), gemm_out_packed, gemm_max_nproj, int(gemm_max_nproj,8)*int(gemm_io_block,8), &
             gemm_natom)

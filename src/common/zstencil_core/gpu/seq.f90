@@ -60,21 +60,7 @@ subroutine zstencil_typical_gpu(io_s,io_e,Nspin,is_array,ie_array,is,ie,idx,idy,
 #define DX(dt) idx(ix+(dt)),iy,iz
 #define DY(dt) ix,idy(iy+(dt)),iz
 #define DZ(dt) ix,iy,idz(iz+(dt))
-!
-! io pulled OUT of the collapse (collapse(5) -> collapse(4)): orbitals are
-! swept by a plain sequential loop per thread instead of being part of the
-! parallel/gang dimension. Verified in zstencil-mini (SALMON stencil
-! mini-app, ~33% synthetic / ~43% real-production stencil-level speedup at
-! 3x3x3/1-GPU, GPU-correctness-checked bit-for-bit against the original
-! structure) -- this is the same restructuring, nothing else changed (no
-! register-tiling: zstencil-mini also showed batching io further doesn't
-! help beyond this). Confirmed to vanish at 4 GPU (nproc_ob=4 already
-! bounds orbitals-per-device the same way, for free) -- expect the biggest
-! win on single/few-GPU runs with many resident orbitals, not at scale-out.
-! The io do/end-do here mirrors exactly where the original's outer
-! collapse(5) do/end-do closed and reopened between the X-pass and
-! Y/Z-pass -- only io's loop now does that instead of all 5 dimensions
-! together.
+! io pulled out of the collapse (collapse(5) -> collapse(4) + seq loop per thread); ~33-43% stencil speedup at 1-GPU, vanishes at 4-GPU.
 !$acc kernels copyin(V_local, tpsi) copy(htpsi)
 !$acc loop collapse(4)
   do ispin=1,Nspin

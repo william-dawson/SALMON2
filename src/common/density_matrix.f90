@@ -273,13 +273,7 @@ contains
     complex(8),allocatable :: uVpsibox2(:,:,:,:,:)
     complex(8),allocatable :: uVpsi(:)
     real(8) :: jx,jy,jz
-    ! Locals for the inlined stencil_current body (OpenACC, non-CUDA branch
-    ! below) -- previously a separate `!$acc routine vector` call; inlined
-    ! to remove that device-routine call boundary. See stencil_current
-    ! (density_matrix.f90:442-516, unchanged, still used by the OMP path
-    ! and other call sites) for the reference implementation this mirrors
-    ! exactly, math-for-math, including its redundant per-axis `cpsi`
-    ! recompute.
+    ! Locals for stencil_current inlined below (OpenACC, non-CUDA branch).
     integer    :: ix,iy,iz
     real(8)    :: rtmp
     complex(8) :: cpsi,xtmp,ytmp,ztmp
@@ -333,13 +327,7 @@ contains
       do ik=info%ik_s,info%ik_e
       do io=info%io_s,info%io_e
         kAc(1:3) = system%vec_k(1:3,ik) + system%vec_Ac(1:3)
-        ! Inlined stencil_current (see its own definition below for the
-        ! byte-for-byte math this mirrors) directly into this gang loop
-        ! instead of calling it as a separate `!$acc routine vector`
-        ! procedure -- removes a real device-routine call boundary
-        ! (confirmed, via a standalone mini-app reproduction, to cost
-        ! measurable register-spill overhead on nvfortran/nvhpc,
-        ! independent of the underlying arithmetic).
+        ! Inlined stencil_current: removes a device-routine call boundary that cost register-spill overhead.
         rtmp = 0d0
         xtmp = 0d0
         ytmp = 0d0

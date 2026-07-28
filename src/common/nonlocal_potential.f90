@@ -674,6 +674,31 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
       uVpsi = uVpsi * ppg%rinv_uvu(1)
       write(*,'(A,I0,A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG lastblock io=',io_e,' gemm=', &
           ppg%uVpsibox(1,1,io_e,ik_s,im_s),' ref=',uVpsi
+
+      ! Full-coverage cross-check: every individual spot-check so far
+      ! (unpadded/padded atoms, band 1/second-block/last-partial-block) has
+      ! matched exactly, yet the bug still reproduces -- sum ALL Nlma
+      ! projectors' uVpsibox (band io_s) via GEMM vs the ORIGINAL per-ilma
+      ! reduction algorithm, covering the entire ilma range at once instead
+      ! of a handful of examples.
+      block
+        complex(8) :: gemm_total, ref_total, ref_val
+        integer :: gemm_check_ilma, gemm_check_ia
+        gemm_total = (0.d0,0.d0)
+        ref_total = (0.d0,0.d0)
+        do gemm_check_ilma = 1, Nlma
+          gemm_check_ia = ppg%ia_tbl(gemm_check_ilma)
+          ref_val = (0.d0,0.d0)
+          do j=1,ppg%mps(gemm_check_ia)
+            ix = ppg%jxyz(1,j,gemm_check_ia); iy = ppg%jxyz(2,j,gemm_check_ia); iz = ppg%jxyz(3,j,gemm_check_ia)
+            ref_val = ref_val + conjg(ppg%zekr_uV(j,gemm_check_ilma,ik_s)) * tpsi%zwf(ix,iy,iz,1,io_s,ik_s,im_s)
+          end do
+          ref_val = ref_val * ppg%rinv_uvu(gemm_check_ilma)
+          gemm_total = gemm_total + ppg%uVpsibox(gemm_check_ilma,1,io_s,ik_s,im_s)
+          ref_total = ref_total + ref_val
+        end do
+        write(*,'(A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG fullcheck io=io_s gemm_total=',gemm_total,' ref_total=',ref_total
+      end block
     end if
 
     ! Phase 2 (back-projection): completely unchanged from the plain-acc

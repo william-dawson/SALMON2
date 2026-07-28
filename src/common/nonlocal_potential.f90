@@ -177,6 +177,9 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
   use structures
   use timer
   use iso_c_binding
+#if defined(USE_OPENACC) && defined(USE_GEMM)
+  use cublas
+#endif
   implicit none
   intrinsic :: aimag
   integer,intent(in) :: nspin
@@ -231,6 +234,36 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
       complex(c_double_complex), intent(in) :: tpsi_zwf(mg_is_array_1:mg_ie_array_1, mg_is_array_2:mg_ie_array_2,mg_is_array_2:mg_ie_array_3, Nspin, io_e:io_s, ik_s:ik_e, im_s:im_e)
     end subroutine zpseudo_cuda
   end interface
+#endif
+#if defined(USE_OPENACC) && defined(USE_GEMM)
+  ! Batched-GEMM reformulation of phase 1 (projection), prototyped and
+  ! validated in zpseudo-mini (see subwg2-benchmarks repo,
+  ! salmon-gpu-optimization-ideas skill idea 2): a ~1.55x win over the
+  ! vector(32) reduction and ~6.7x over the hand-written CUDA kernel at
+  ! natom=486/nproj=15 (matching this real code's actual atom/projector
+  ! counts). Phase 2 (back-projection) is completely unchanged, still the
+  ! existing atomic-free inverse-gather-map algorithm below.
+  !
+  ! Real SALMON's own ppg%jxyz(3,ppg%nps,natom)/ppg%zekr_uV(ppg%nps,Nlma,ik)
+  ! are allocated via plain `allocate` and only filled up to
+  ! ppg%mps(ia)/the atom's actual projector count (confirmed by reading
+  ! prep_pp.f90/hamiltonian.f90) -- rows beyond that are genuinely
+  ! uninitialized, not zero. A batched GEMM with K=ppg%nps unconditionally
+  ! reads every row for every batch element, so using those arrays directly
+  ! would multiply real data against garbage. Fixed by building our OWN
+  ! zero-padded, dense companion arrays ONCE (SAVE'd, matching this file's
+  ! own htpsi_zwf_r/i idiom above) rather than trusting the original
+  ! arrays' unused-region contents.
+  integer, parameter :: gemm_io_block = 64
+  integer,save :: gemm_max_nproj = -1
+  integer,allocatable,save :: gemm_nproj_atom(:), gemm_l2g(:,:)
+  complex(8),allocatable,save :: gemm_zekr_packed(:,:,:,:)
+  real(8),allocatable,save :: gemm_rinv_packed(:,:)
+  complex(8),allocatable,save :: gemm_wf_packed(:,:,:), gemm_out_packed(:,:,:)
+  type(cublasHandle),save :: gemm_handle
+  logical,save :: gemm_handle_created = .false.
+  integer :: gemm_ia, gemm_p, gemm_ilma, gemm_j, gemm_natom
+  integer :: gemm_io_blk_s, gemm_this_block, gemm_io_local, gemm_stat
 #endif
 
 #ifdef FORTRAN_COMPILER_HAS_2MB_ALIGNED_ALLOCATION
@@ -402,6 +435,151 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
         ppg%zekr_uV,&
         ppg%rinv_uvu,&
         tpsi%zwf)
+#elif defined(USE_GEMM)
+    gemm_natom = size(ppg%mps)
+
+    ! --- one-time setup: build zero-padded, dense companion arrays ---
+    if (gemm_max_nproj < 0) then
+      allocate(gemm_nproj_atom(gemm_natom))
+      gemm_nproj_atom = 0
+      do ilma=1,Nlma
+        ia = ppg%ia_tbl(ilma)
+        gemm_nproj_atom(ia) = gemm_nproj_atom(ia) + 1
+      end do
+      gemm_max_nproj = maxval(gemm_nproj_atom)
+
+      allocate(gemm_l2g(gemm_max_nproj, gemm_natom))
+      gemm_l2g = 0
+      gemm_nproj_atom = 0   ! reused as a per-atom fill cursor below
+      do ilma=1,Nlma
+        ia = ppg%ia_tbl(ilma)
+        gemm_nproj_atom(ia) = gemm_nproj_atom(ia) + 1
+        gemm_l2g(gemm_nproj_atom(ia), ia) = ilma
+      end do
+
+      ! Zero-init THEN fill only the valid (j<=mps(ia), p<=nproj_atom(ia))
+      ! region -- ppg%zekr_uV's own out-of-range rows are uninitialized
+      ! (see header comment), so we deliberately never read them here.
+      allocate(gemm_zekr_packed(ppg%nps, gemm_max_nproj, gemm_natom, ik_s:ik_e))
+      allocate(gemm_rinv_packed(gemm_max_nproj, gemm_natom))
+      gemm_zekr_packed = (0.d0,0.d0)
+      gemm_rinv_packed = 0.d0
+      do ik=ik_s,ik_e
+      do gemm_ia=1,gemm_natom
+      do gemm_p=1,gemm_nproj_atom(gemm_ia)
+        gemm_ilma = gemm_l2g(gemm_p, gemm_ia)
+        do gemm_j=1,ppg%mps(gemm_ia)
+          gemm_zekr_packed(gemm_j, gemm_p, gemm_ia, ik) = ppg%zekr_uV(gemm_j, gemm_ilma, ik)
+        end do
+        gemm_rinv_packed(gemm_p, gemm_ia) = ppg%rinv_uvu(gemm_ilma)
+      end do
+      end do
+      end do
+!$acc enter data copyin(gemm_zekr_packed, gemm_rinv_packed, gemm_l2g, gemm_nproj_atom)
+
+      ! gemm_wf_packed zero-initialized on the host THEN copied in once --
+      ! its (j>mps(ia)) padding rows must reach the device as real zeros,
+      ! not garbage, since every future call only ever overwrites the
+      ! valid (j<=mps(ia)) sub-region, leaving the zero padding untouched
+      ! (and correct) for the lifetime of the run.
+      allocate(gemm_wf_packed(ppg%nps, gemm_io_block, gemm_natom))
+      allocate(gemm_out_packed(gemm_max_nproj, gemm_io_block, gemm_natom))
+      gemm_wf_packed = (0.d0, 0.d0)
+!$acc enter data copyin(gemm_wf_packed) create(gemm_out_packed)
+
+      gemm_stat = cublasCreate(gemm_handle)
+      gemm_handle_created = .true.
+    end if
+
+    ! --- per-call: batched GEMM projection, blocked over bands ---
+    do im=im_s,im_e
+    do ik=ik_s,ik_e
+    do ispin=1,Nspin
+      gemm_io_blk_s = io_s
+      do while (gemm_io_blk_s <= io_e)
+        gemm_this_block = min(gemm_io_block, io_e - gemm_io_blk_s + 1)
+
+        ! Gather: only the valid (j<=mps(ia)) region is touched, matching
+        ! the ONLY safe read range of ppg%jxyz (reading beyond mps(ia)
+        ! would be an out-of-bounds array-index use, not just a wrong
+        ! answer -- see header comment). Padding stays the zero it was
+        ! copied in as above.
+!$acc parallel loop collapse(3) present(tpsi,ppg,gemm_wf_packed)
+        do gemm_ia = 1, gemm_natom
+        do gemm_io_local = 1, gemm_this_block
+        do gemm_j = 1, ppg%mps(gemm_ia)
+          gemm_wf_packed(gemm_j, gemm_io_local, gemm_ia) = tpsi%zwf( &
+              ppg%jxyz(1,gemm_j,gemm_ia), ppg%jxyz(2,gemm_j,gemm_ia), ppg%jxyz(3,gemm_j,gemm_ia), &
+              ispin, gemm_io_blk_s+gemm_io_local-1, ik, im)
+        end do
+        end do
+        end do
+
+        ! Batched GEMM: (max_nproj x nps) @ (nps x this_block) per atom,
+        ! natom batches. CUBLAS_OP_C applies conjg() as part of the GEMM.
+!$acc host_data use_device(gemm_zekr_packed, gemm_wf_packed, gemm_out_packed)
+        gemm_stat = cublasZgemmStridedBatched(gemm_handle, CUBLAS_OP_C, CUBLAS_OP_N, &
+            gemm_max_nproj, gemm_this_block, ppg%nps, &
+            (1.d0,0.d0), gemm_zekr_packed(:,:,:,ik), ppg%nps, int(ppg%nps,8)*int(gemm_max_nproj,8), &
+            gemm_wf_packed, ppg%nps, int(ppg%nps,8)*int(gemm_io_block,8), &
+            (0.d0,0.d0), gemm_out_packed, gemm_max_nproj, int(gemm_max_nproj,8)*int(gemm_io_block,8), &
+            gemm_natom)
+!$acc end host_data
+
+        ! Scale by rinv_uvu, scatter the GEMM's dense (p,io_local,ia)
+        ! output back into ppg%uVpsibox's original ilma indexing (via
+        ! gemm_l2g) -- padding projector rows (p>nproj_atom(ia)) are
+        ! skipped, never written (their GEMM output is meaningless: a
+        ! zero-projector-row dot product, harmless but not a real ilma).
+!$acc parallel loop collapse(3) present(ppg,gemm_out_packed,gemm_rinv_packed,gemm_l2g,gemm_nproj_atom)
+        do gemm_ia = 1, gemm_natom
+        do gemm_io_local = 1, gemm_this_block
+        do gemm_p = 1, gemm_max_nproj
+          if (gemm_p <= gemm_nproj_atom(gemm_ia)) then
+            ppg%uVpsibox(gemm_l2g(gemm_p,gemm_ia), ispin, gemm_io_blk_s+gemm_io_local-1, ik, im) = &
+                gemm_out_packed(gemm_p, gemm_io_local, gemm_ia) * gemm_rinv_packed(gemm_p, gemm_ia)
+          end if
+        end do
+        end do
+        end do
+
+        gemm_io_blk_s = gemm_io_blk_s + gemm_this_block
+      end do
+    end do
+    end do
+    end do
+
+    ! Phase 2 (back-projection): completely unchanged from the plain-acc
+    ! path below -- same atomic-free inverse-gather-map algorithm, own
+    ! acc kernels region since phase 1 no longer shares one with it here.
+!$acc kernels present(ppg,tpsi,htpsi)
+!$acc loop collapse(5) independent private(ilocal,ilma,ia,uVpsi,vi,my_nlma,k,j,ix,iy,iz,wrk)
+    do im=im_s,im_e
+    do ik=ik_s,ik_e
+    do io=io_s,io_e
+    do ispin=1,Nspin
+      do vi=0,ppg%max_vi-1
+        my_nlma = ppg%v2nlma(vi)
+        if (my_nlma < 1) cycle
+
+        wrk = 0d0
+!$acc loop seq
+        do k=1,my_nlma
+          ilma = ppg%k2ilma(vi,k)
+          j    = ppg%k2j(vi,k)
+          wrk  = wrk + ppg%uVpsibox(ilma,ispin,io,ik,im) * ppg%zekr_uV(j,ilma,ik)
+        end do
+
+        ix = ppg%v2j(1,vi)
+        iy = ppg%v2j(2,vi)
+        iz = ppg%v2j(3,vi)
+        htpsi%zwf(ix,iy,iz,ispin,io,ik,im) = htpsi%zwf(ix,iy,iz,ispin,io,ik,im) + wrk
+      end do
+    end do
+    end do
+    end do
+    end do
+!$acc end kernels
 #else
 !$acc kernels present(ppg,tpsi,htpsi)
 !$acc loop collapse(5) independent gang private(ilocal,ilma,ia,uVpsi,vi,my_nlma,k,j,ix,iy,iz,wrk)

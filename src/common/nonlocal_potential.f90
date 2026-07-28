@@ -605,6 +605,43 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
       uVpsi = uVpsi * ppg%rinv_uvu(2)
       write(*,'(A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG uVpsibox(ilma=2) gemm=',ppg%uVpsibox(2,1,io_s,ik_s,im_s), &
           ' ref=',uVpsi
+
+      ! Atom 1 has nproj_atom(1)=max_nproj (no padding) -- find an atom
+      ! that actually needs padding (nproj_atom(ia) < max_nproj) and check
+      ! both its first and its LAST valid projector, since that's the
+      ! untested case (real SiO2 stoichiometry: Si atoms use all 18 slots,
+      ! O atoms only use 13, so the majority of atoms are padded and were
+      ! never actually exercised by the atom-1-only check above).
+      gemm_ia = 0
+      do gemm_j = 1, gemm_natom
+        if (gemm_nproj_atom(gemm_j) < gemm_max_nproj) then
+          gemm_ia = gemm_j
+          exit
+        end if
+      end do
+      write(*,'(A,I0,A,I0,A,I0)') 'GEMM_DEBUG padded_atom ia=',gemm_ia,' nproj=',gemm_nproj_atom(max(gemm_ia,1)), &
+          ' mps=',ppg%mps(max(gemm_ia,1))
+      if (gemm_ia > 0) then
+        gemm_ilma = gemm_l2g(1, gemm_ia)
+        uVpsi = 0.d0
+        do j=1,ppg%mps(gemm_ia)
+          ix = ppg%jxyz(1,j,gemm_ia); iy = ppg%jxyz(2,j,gemm_ia); iz = ppg%jxyz(3,j,gemm_ia)
+          uVpsi = uVpsi + conjg(ppg%zekr_uV(j,gemm_ilma,ik_s)) * tpsi%zwf(ix,iy,iz,1,io_s,ik_s,im_s)
+        end do
+        uVpsi = uVpsi * ppg%rinv_uvu(gemm_ilma)
+        write(*,'(A,I0,A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG padded_first ilma=',gemm_ilma,' gemm=', &
+            ppg%uVpsibox(gemm_ilma,1,io_s,ik_s,im_s),' ref=',uVpsi
+
+        gemm_ilma = gemm_l2g(gemm_nproj_atom(gemm_ia), gemm_ia)
+        uVpsi = 0.d0
+        do j=1,ppg%mps(gemm_ia)
+          ix = ppg%jxyz(1,j,gemm_ia); iy = ppg%jxyz(2,j,gemm_ia); iz = ppg%jxyz(3,j,gemm_ia)
+          uVpsi = uVpsi + conjg(ppg%zekr_uV(j,gemm_ilma,ik_s)) * tpsi%zwf(ix,iy,iz,1,io_s,ik_s,im_s)
+        end do
+        uVpsi = uVpsi * ppg%rinv_uvu(gemm_ilma)
+        write(*,'(A,I0,A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG padded_last ilma=',gemm_ilma,' gemm=', &
+            ppg%uVpsibox(gemm_ilma,1,io_s,ik_s,im_s),' ref=',uVpsi
+      end if
     end if
 
     ! Phase 2 (back-projection): completely unchanged from the plain-acc

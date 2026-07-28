@@ -264,6 +264,7 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
   type(cublasHandle),save :: gemm_handle
   logical,save :: gemm_handle_created = .false.
   logical,save :: gemm_debug_printed = .false.
+  integer,save :: gemm_call_count = 0
   integer :: gemm_ia, gemm_p, gemm_ilma, gemm_j, gemm_natom
   integer :: gemm_io_blk_s, gemm_this_block, gemm_io_local, gemm_stat
 #endif
@@ -587,7 +588,15 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
     ! projectors, first orbital/spin/k/im) against a plain host-side
     ! reference computed directly from tpsi/zekr_uV/jxyz, mirroring the
     ! original reduction algorithm exactly.
-    if (.not. gemm_debug_printed) then
+    !
+    ! Fires on call #GEMM_DEBUG_CALL (not call #1): every earlier check at
+    ! call 1 matched exactly (including a full-Nlma-coverage sum), yet the
+    ! electron-count drift only becomes visible by RT step 10 (~40-60 hpsi
+    ! calls in) -- if this same check now fails at a later call, that
+    ! points to state corruption building up across repeated calls rather
+    ! than a one-shot logic bug in the per-call math itself.
+    gemm_call_count = gemm_call_count + 1
+    if (gemm_call_count == 50 .and. .not. gemm_debug_printed) then
       gemm_debug_printed = .true.
       uVpsi = 0.d0
       do j=1,ppg%mps(1)

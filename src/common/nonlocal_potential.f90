@@ -493,6 +493,19 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
 
       gemm_stat = cublasCreate(gemm_handle)
       gemm_handle_created = .true.
+
+      ! TEMPORARY DIAGNOSTIC -- remove before merging.
+      write(*,'(A,I0,A,I0,A,I0,A,I0)') 'GEMM_DEBUG natom=',gemm_natom,' Nlma=',Nlma, &
+          ' max_nproj=',gemm_max_nproj,' sum_nproj=',sum(gemm_nproj_atom)
+      write(*,'(A,I0,A,I0)') 'GEMM_DEBUG mps(1)=',ppg%mps(1),' nps=',ppg%nps
+      write(*,'(A,I0,A,I0)') 'GEMM_DEBUG l2g(1,1)=',gemm_l2g(1,1),' ia_tbl(l2g(1,1))=',ppg%ia_tbl(gemm_l2g(1,1))
+      write(*,'(A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG zekr_packed(1,1,1)=',gemm_zekr_packed(1,1,1), &
+          ' zekr_uV(1,l2g(1,1),ik_s)=',ppg%zekr_uV(1,gemm_l2g(1,1),ik_s)
+      write(*,'(A,ES16.8,A,ES16.8)') 'GEMM_DEBUG rinv_packed(1,1)=',gemm_rinv_packed(1,1), &
+          ' rinv_uvu(l2g(1,1))=',ppg%rinv_uvu(gemm_l2g(1,1))
+      if (gemm_max_nproj > 1) then
+        write(*,'(A,I0,A,I0)') 'GEMM_DEBUG l2g(2,1)=',gemm_l2g(2,1),' nproj_atom(1)=',gemm_nproj_atom(1)
+      end if
     end if
 
     ! --- per-call: batched GEMM projection, blocked over bands ---

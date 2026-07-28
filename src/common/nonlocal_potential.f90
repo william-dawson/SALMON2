@@ -642,6 +642,23 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
         write(*,'(A,I0,A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG padded_last ilma=',gemm_ilma,' gemm=', &
             ppg%uVpsibox(gemm_ilma,1,io_s,ik_s,im_s),' ref=',uVpsi
       end if
+
+      ! Everything checked so far is band io_s (block 1 of the do-while
+      ! band-blocking loop). Check a band from the SECOND block
+      ! (io_s+gemm_io_block) too, atom 1/ilma=1 -- this isolates whether
+      ! the bug is specific to crossing a block boundary (e.g. an
+      ! absolute-vs-relative band index mixup) rather than atom padding.
+      if (io_e >= io_s + gemm_io_block) then
+        gemm_j = io_s + gemm_io_block
+        uVpsi = 0.d0
+        do j=1,ppg%mps(1)
+          ix = ppg%jxyz(1,j,1); iy = ppg%jxyz(2,j,1); iz = ppg%jxyz(3,j,1)
+          uVpsi = uVpsi + conjg(ppg%zekr_uV(j,1,ik_s)) * tpsi%zwf(ix,iy,iz,1,gemm_j,ik_s,im_s)
+        end do
+        uVpsi = uVpsi * ppg%rinv_uvu(1)
+        write(*,'(A,I0,A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG block2 io=',gemm_j,' gemm=', &
+            ppg%uVpsibox(1,1,gemm_j,ik_s,im_s),' ref=',uVpsi
+      end if
     end if
 
     ! Phase 2 (back-projection): completely unchanged from the plain-acc

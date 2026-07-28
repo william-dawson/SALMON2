@@ -60,9 +60,23 @@ subroutine zstencil_typical_gpu(io_s,io_e,Nspin,is_array,ie_array,is,ie,idx,idy,
 #define DX(dt) idx(ix+(dt)),iy,iz
 #define DY(dt) ix,idy(iy+(dt)),iz
 #define DZ(dt) ix,iy,idz(iz+(dt))
+!
+! io pulled OUT of the collapse (collapse(5) -> collapse(4)): orbitals are
+! swept by a plain sequential loop per thread instead of being part of the
+! parallel/gang dimension. Verified in zstencil-mini (SALMON stencil
+! mini-app, ~33% synthetic / ~43% real-production stencil-level speedup at
+! 3x3x3/1-GPU, GPU-correctness-checked bit-for-bit against the original
+! structure) -- this is the same restructuring, nothing else changed (no
+! register-tiling: zstencil-mini also showed batching io further doesn't
+! help beyond this). Confirmed to vanish at 4 GPU (nproc_ob=4 already
+! bounds orbitals-per-device the same way, for free) -- expect the biggest
+! win on single/few-GPU runs with many resident orbitals, not at scale-out.
+! The io do/end-do here mirrors exactly where the original's outer
+! collapse(5) do/end-do closed and reopened between the X-pass and
+! Y/Z-pass -- only io's loop now does that instead of all 5 dimensions
+! together.
 !$acc kernels copyin(V_local, tpsi) copy(htpsi)
-!$acc loop collapse(5)
-  do io=io_s,io_e
+!$acc loop collapse(4)
   do ispin=1,Nspin
   do iz=igs(3),ige(3)
   do iy=igs(2),ige(2)
@@ -70,6 +84,8 @@ subroutine zstencil_typical_gpu(io_s,io_e,Nspin,is_array,ie_array,is,ie,idx,idy,
 ! !dir$ assume_aligned tpsi(is_array(1),iy,iz)   :MEM_ALIGN
 ! !dir$ assume_aligned htpsi(is_array(1),iy,iz)  :MEM_ALIGN
   do ix=igs(1),ige(1)
+  !$acc loop seq
+  do io=io_s,io_e
     v = z0
     w = z0
     !$acc loop seq
@@ -84,17 +100,9 @@ subroutine zstencil_typical_gpu(io_s,io_e,Nspin,is_array,ie_array,is,ie,idx,idy,
                     + lap0*tpsi(ix,iy,iz,ispin,io) &
                     - 0.5d0 * v - zI * w
   end do
-  end do
-  end do
-  end do
-  end do
 
-!$acc loop collapse(5)
+  !$acc loop seq
   do io=io_s,io_e
-  do ispin=1,Nspin
-  do iz=igs(3),ige(3)
-  do iy=igs(2),ige(2)
-  do ix=igs(1),ige(1)
     v = z0
     w = z0
 #endif

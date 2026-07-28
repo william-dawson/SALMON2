@@ -179,6 +179,7 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
   use iso_c_binding
 #if defined(USE_OPENACC) && defined(USE_GEMM)
   use cublas
+  use openacc
 #endif
   implicit none
   intrinsic :: aimag
@@ -493,6 +494,14 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
 !$acc enter data copyin(gemm_wf_packed) create(gemm_out_packed)
 
       gemm_stat = cublasCreate(gemm_handle)
+      ! Without this, cublas launches on CUDA's default stream while the
+      ! surrounding OpenACC gather/scatter kernels run on NVHPC's own
+      ! accelerator queue -- nothing then guarantees the GEMM completes
+      ! before the scatter kernel starts reading gemm_out_packed. Binding
+      ! cublas to the same queue OpenACC's synchronous (non-async) regions
+      ! use makes all three (gather, GEMM, scatter) serialize in-order,
+      ! per NVIDIA's documented OpenACC/cuBLAS interop pattern.
+      gemm_stat = cublasSetStream(gemm_handle, acc_get_cuda_stream(acc_async_sync))
       gemm_handle_created = .true.
 
       ! TEMPORARY DIAGNOSTIC -- remove before merging.

@@ -519,6 +519,19 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
       end if
     end if
 
+    ! Rebind cublas to the CURRENT synchronous OpenACC stream on every call,
+    ! not just once at setup. Suspected root cause of the correctness bug
+    ! (electron-count drift starting ~call 50, exhaustively NOT explained
+    ! by wrong values -- setup, padding, zekr, rinv, and a full-Nlma
+    ! coverage sum have all been individually verified correct): NVHPC's
+    ! runtime may not keep "the synchronous queue" pinned to one physical
+    ! CUDA stream for the life of the program, rotating it across the many
+    ! OTHER OpenACC kernel launches elsewhere in SALMON between calls to
+    ! this subroutine. A one-time bind at setup (call 1) would then go
+    ! stale exactly the way observed: correct before any rotation, silently
+    ! wrong once the runtime has moved on to a different physical stream.
+    gemm_stat = cublasSetStream(gemm_handle, acc_get_cuda_stream(acc_async_sync))
+
     ! --- per-call: batched GEMM projection, blocked over bands ---
     do im=im_s,im_e
     do ik=ik_s,ik_e

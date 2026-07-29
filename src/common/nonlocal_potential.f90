@@ -708,6 +708,16 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
         end do
         write(*,'(A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG fullcheck io=io_s gemm_total=',gemm_total,' ref_total=',ref_total
       end block
+
+      ! gemm_wf_packed's (j>mps(ia)) padding rows are only ever zeroed ONCE
+      ! at setup and never rewritten by any gather step -- the whole design
+      ! assumes they stay zero for the run's lifetime. If something (most
+      ! plausibly cublas's own internal workspace churn reusing that
+      ! memory) corrupts them over repeated calls, that would explain
+      ! exactly this pattern: correct at call 1, wrong by call 50. Check a
+      ! definitely-padding cell for atom 1 directly (mps(1)=960 < nps=968).
+      write(*,'(A,2ES16.8)') 'GEMM_DEBUG padding_check gemm_wf_packed(965,1,1) (should be 0,0) =', &
+          gemm_wf_packed(965,1,1)
     end if
 
     ! Phase 2 (back-projection): completely unchanged from the plain-acc

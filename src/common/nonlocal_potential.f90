@@ -263,8 +263,6 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
   complex(8),allocatable,save :: gemm_wf_packed(:,:,:), gemm_out_packed(:,:,:)
   type(cublasHandle),save :: gemm_handle
   logical,save :: gemm_handle_created = .false.
-  logical,save :: gemm_debug_printed = .false.
-  integer,save :: gemm_call_count = 0
   integer :: gemm_ia, gemm_p, gemm_ilma, gemm_j, gemm_natom
   integer :: gemm_io_blk_s, gemm_this_block, gemm_io_local, gemm_stat
 #endif
@@ -504,19 +502,6 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
       ! per NVIDIA's documented OpenACC/cuBLAS interop pattern.
       gemm_stat = cublasSetStream(gemm_handle, acc_get_cuda_stream(acc_async_sync))
       gemm_handle_created = .true.
-
-      ! TEMPORARY DIAGNOSTIC -- remove before merging.
-      write(*,'(A,I0,A,I0,A,I0,A,I0)') 'GEMM_DEBUG natom=',gemm_natom,' Nlma=',Nlma, &
-          ' max_nproj=',gemm_max_nproj,' sum_nproj=',sum(gemm_nproj_atom)
-      write(*,'(A,I0,A,I0)') 'GEMM_DEBUG mps(1)=',ppg%mps(1),' nps=',ppg%nps
-      write(*,'(A,I0,A,I0)') 'GEMM_DEBUG l2g(1,1)=',gemm_l2g(1,1),' ia_tbl(l2g(1,1))=',ppg%ia_tbl(gemm_l2g(1,1))
-      write(*,'(A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG zekr_packed(1,1,1)=',gemm_zekr_packed(1,1,1), &
-          ' zekr_uV(1,l2g(1,1),ik_s)=',ppg%zekr_uV(1,gemm_l2g(1,1),ik_s)
-      write(*,'(A,ES16.8,A,ES16.8)') 'GEMM_DEBUG rinv_packed(1,1)=',gemm_rinv_packed(1,1), &
-          ' rinv_uvu(l2g(1,1))=',ppg%rinv_uvu(gemm_l2g(1,1))
-      if (gemm_max_nproj > 1) then
-        write(*,'(A,I0,A,I0)') 'GEMM_DEBUG l2g(2,1)=',gemm_l2g(2,1),' nproj_atom(1)=',gemm_nproj_atom(1)
-      end if
     end if
 
     gemm_stat = cublasSetStream(gemm_handle, acc_get_cuda_stream(acc_async_sync))
@@ -613,151 +598,6 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
     end do
     end do
 
-    ! TEMPORARY DIAGNOSTIC -- remove before merging. Compare the GEMM's
-    ! actual uVpsibox(1,...) / uVpsibox(2,...) (atom 1's first two
-    ! projectors, first orbital/spin/k/im) against a plain host-side
-    ! reference computed directly from tpsi/zekr_uV/jxyz, mirroring the
-    ! original reduction algorithm exactly.
-    !
-    ! Fires on call #GEMM_DEBUG_CALL (not call #1): every earlier check at
-    ! call 1 matched exactly (including a full-Nlma-coverage sum), yet the
-    ! electron-count drift only becomes visible by RT step 10 (~40-60 hpsi
-    ! calls in) -- if this same check now fails at a later call, that
-    ! points to state corruption building up across repeated calls rather
-    ! than a one-shot logic bug in the per-call math itself.
-    gemm_call_count = gemm_call_count + 1
-    if (gemm_call_count == 50 .and. .not. gemm_debug_printed) then
-      gemm_debug_printed = .true.
-      uVpsi = 0.d0
-      do j=1,ppg%mps(1)
-        ix = ppg%jxyz(1,j,1); iy = ppg%jxyz(2,j,1); iz = ppg%jxyz(3,j,1)
-        uVpsi = uVpsi + conjg(ppg%zekr_uV(j,1,ik_s)) * tpsi%zwf(ix,iy,iz,1,io_s,ik_s,im_s)
-      end do
-      uVpsi = uVpsi * ppg%rinv_uvu(1)
-      write(*,'(A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG uVpsibox(ilma=1) gemm=',ppg%uVpsibox(1,1,io_s,ik_s,im_s), &
-          ' ref=',uVpsi
-      uVpsi = 0.d0
-      do j=1,ppg%mps(1)
-        ix = ppg%jxyz(1,j,1); iy = ppg%jxyz(2,j,1); iz = ppg%jxyz(3,j,1)
-        uVpsi = uVpsi + conjg(ppg%zekr_uV(j,2,ik_s)) * tpsi%zwf(ix,iy,iz,1,io_s,ik_s,im_s)
-      end do
-      uVpsi = uVpsi * ppg%rinv_uvu(2)
-      write(*,'(A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG uVpsibox(ilma=2) gemm=',ppg%uVpsibox(2,1,io_s,ik_s,im_s), &
-          ' ref=',uVpsi
-
-      ! Atom 1 has nproj_atom(1)=max_nproj (no padding) -- find an atom
-      ! that actually needs padding (nproj_atom(ia) < max_nproj) and check
-      ! both its first and its LAST valid projector, since that's the
-      ! untested case (real SiO2 stoichiometry: Si atoms use all 18 slots,
-      ! O atoms only use 13, so the majority of atoms are padded and were
-      ! never actually exercised by the atom-1-only check above).
-      gemm_ia = 0
-      do gemm_j = 1, gemm_natom
-        if (gemm_nproj_atom(gemm_j) < gemm_max_nproj) then
-          gemm_ia = gemm_j
-          exit
-        end if
-      end do
-      write(*,'(A,I0,A,I0,A,I0)') 'GEMM_DEBUG padded_atom ia=',gemm_ia,' nproj=',gemm_nproj_atom(max(gemm_ia,1)), &
-          ' mps=',ppg%mps(max(gemm_ia,1))
-      if (gemm_ia > 0) then
-        gemm_ilma = gemm_l2g(1, gemm_ia)
-        uVpsi = 0.d0
-        do j=1,ppg%mps(gemm_ia)
-          ix = ppg%jxyz(1,j,gemm_ia); iy = ppg%jxyz(2,j,gemm_ia); iz = ppg%jxyz(3,j,gemm_ia)
-          uVpsi = uVpsi + conjg(ppg%zekr_uV(j,gemm_ilma,ik_s)) * tpsi%zwf(ix,iy,iz,1,io_s,ik_s,im_s)
-        end do
-        uVpsi = uVpsi * ppg%rinv_uvu(gemm_ilma)
-        write(*,'(A,I0,A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG padded_first ilma=',gemm_ilma,' gemm=', &
-            ppg%uVpsibox(gemm_ilma,1,io_s,ik_s,im_s),' ref=',uVpsi
-
-        gemm_ilma = gemm_l2g(gemm_nproj_atom(gemm_ia), gemm_ia)
-        uVpsi = 0.d0
-        do j=1,ppg%mps(gemm_ia)
-          ix = ppg%jxyz(1,j,gemm_ia); iy = ppg%jxyz(2,j,gemm_ia); iz = ppg%jxyz(3,j,gemm_ia)
-          uVpsi = uVpsi + conjg(ppg%zekr_uV(j,gemm_ilma,ik_s)) * tpsi%zwf(ix,iy,iz,1,io_s,ik_s,im_s)
-        end do
-        uVpsi = uVpsi * ppg%rinv_uvu(gemm_ilma)
-        write(*,'(A,I0,A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG padded_last ilma=',gemm_ilma,' gemm=', &
-            ppg%uVpsibox(gemm_ilma,1,io_s,ik_s,im_s),' ref=',uVpsi
-      end if
-
-      ! Everything checked so far is band io_s (block 1 of the do-while
-      ! band-blocking loop). Check a band from the SECOND block
-      ! (io_s+gemm_io_block) too, atom 1/ilma=1 -- this isolates whether
-      ! the bug is specific to crossing a block boundary (e.g. an
-      ! absolute-vs-relative band index mixup) rather than atom padding.
-      if (io_e >= io_s + gemm_io_block) then
-        gemm_j = io_s + gemm_io_block
-        uVpsi = 0.d0
-        do j=1,ppg%mps(1)
-          ix = ppg%jxyz(1,j,1); iy = ppg%jxyz(2,j,1); iz = ppg%jxyz(3,j,1)
-          uVpsi = uVpsi + conjg(ppg%zekr_uV(j,1,ik_s)) * tpsi%zwf(ix,iy,iz,1,gemm_j,ik_s,im_s)
-        end do
-        uVpsi = uVpsi * ppg%rinv_uvu(1)
-        write(*,'(A,I0,A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG block2 io=',gemm_j,' gemm=', &
-            ppg%uVpsibox(1,1,gemm_j,ik_s,im_s),' ref=',uVpsi
-      end if
-
-      ! Everything so far falls in a FULL-width band block (io_s is block 1,
-      ! io_s+gemm_io_block is block 2, both size gemm_io_block). If
-      ! (io_e-io_s+1) isn't a multiple of gemm_io_block, the LAST block is
-      ! partial (this_block < gemm_io_block) -- untested until now. Check
-      ! the very last band (io_e), atom 1/ilma=1.
-      write(*,'(A,I0,A,I0)') 'GEMM_DEBUG nstate=',io_e-io_s+1,' io_block=',gemm_io_block
-      uVpsi = 0.d0
-      do j=1,ppg%mps(1)
-        ix = ppg%jxyz(1,j,1); iy = ppg%jxyz(2,j,1); iz = ppg%jxyz(3,j,1)
-        uVpsi = uVpsi + conjg(ppg%zekr_uV(j,1,ik_s)) * tpsi%zwf(ix,iy,iz,1,io_e,ik_s,im_s)
-      end do
-      uVpsi = uVpsi * ppg%rinv_uvu(1)
-      write(*,'(A,I0,A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG lastblock io=',io_e,' gemm=', &
-          ppg%uVpsibox(1,1,io_e,ik_s,im_s),' ref=',uVpsi
-
-      ! Full-coverage cross-check: every individual spot-check so far
-      ! (unpadded/padded atoms, band 1/second-block/last-partial-block) has
-      ! matched exactly, yet the bug still reproduces -- sum ALL Nlma
-      ! projectors' uVpsibox (band io_s) via GEMM vs the ORIGINAL per-ilma
-      ! reduction algorithm, covering the entire ilma range at once instead
-      ! of a handful of examples.
-      block
-        complex(8) :: gemm_total, ref_total, ref_val
-        integer :: gemm_check_ilma, gemm_check_ia
-        gemm_total = (0.d0,0.d0)
-        ref_total = (0.d0,0.d0)
-        do gemm_check_ilma = 1, Nlma
-          gemm_check_ia = ppg%ia_tbl(gemm_check_ilma)
-          ref_val = (0.d0,0.d0)
-          do j=1,ppg%mps(gemm_check_ia)
-            ix = ppg%jxyz(1,j,gemm_check_ia); iy = ppg%jxyz(2,j,gemm_check_ia); iz = ppg%jxyz(3,j,gemm_check_ia)
-            ref_val = ref_val + conjg(ppg%zekr_uV(j,gemm_check_ilma,ik_s)) * tpsi%zwf(ix,iy,iz,1,io_s,ik_s,im_s)
-          end do
-          ref_val = ref_val * ppg%rinv_uvu(gemm_check_ilma)
-          gemm_total = gemm_total + ppg%uVpsibox(gemm_check_ilma,1,io_s,ik_s,im_s)
-          ref_total = ref_total + ref_val
-        end do
-        write(*,'(A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG fullcheck io=io_s gemm_total=',gemm_total,' ref_total=',ref_total
-      end block
-
-      ! gemm_wf_packed's (j>mps(ia)) padding rows are only ever zeroed ONCE
-      ! at setup and never rewritten by any gather step -- the whole design
-      ! assumes they stay zero for the run's lifetime. If something (most
-      ! plausibly cublas's own internal workspace churn reusing that
-      ! memory) corrupts them over repeated calls, that would explain
-      ! exactly this pattern: correct at call 1, wrong by call 50. Check a
-      ! definitely-padding cell for atom 1 directly (mps(1)=960 < nps=968).
-      write(*,'(A,2ES16.8)') 'GEMM_DEBUG padding_check gemm_wf_packed(965,1,1) (should be 0,0) =', &
-          gemm_wf_packed(965,1,1)
-
-      ! gemm_zekr_packed/gemm_rinv_packed are also built ONCE at setup and
-      ! never rewritten -- re-verify they still match their source arrays
-      ! at call 50 (same check the setup diagnostic did at call 1), to
-      ! rule out these "constant" arrays drifting/getting corrupted too.
-      write(*,'(A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG zekr_recheck gemm=',gemm_zekr_packed(1,1,1), &
-          ' src=',ppg%zekr_uV(1,gemm_l2g(1,1),ik_s)
-      write(*,'(A,ES16.8,A,ES16.8)') 'GEMM_DEBUG rinv_recheck gemm=',gemm_rinv_packed(1,1), &
-          ' src=',ppg%rinv_uvu(gemm_l2g(1,1))
-    end if
 
     ! Phase 2 (back-projection): completely unchanged from the plain-acc
     ! path below -- same atomic-free inverse-gather-map algorithm, own

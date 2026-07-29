@@ -342,12 +342,10 @@ contains
                       + stencil%coef_nab(2,1) * cpsi * psi%zwf(mg%idx(ix+2),iy,iz,ispin,io,ik,im) &
                       + stencil%coef_nab(3,1) * cpsi * psi%zwf(mg%idx(ix+3),iy,iz,ispin,io,ik,im) &
                       + stencil%coef_nab(4,1) * cpsi * psi%zwf(mg%idx(ix+4),iy,iz,ispin,io,ik,im)
-          cpsi = conjg(psi%zwf(ix,iy,iz,ispin,io,ik,im))
           ytmp = ytmp + stencil%coef_nab(1,2) * cpsi * psi%zwf(ix,mg%idy(iy+1),iz,ispin,io,ik,im) &
                       + stencil%coef_nab(2,2) * cpsi * psi%zwf(ix,mg%idy(iy+2),iz,ispin,io,ik,im) &
                       + stencil%coef_nab(3,2) * cpsi * psi%zwf(ix,mg%idy(iy+3),iz,ispin,io,ik,im) &
                       + stencil%coef_nab(4,2) * cpsi * psi%zwf(ix,mg%idy(iy+4),iz,ispin,io,ik,im)
-          cpsi = conjg(psi%zwf(ix,iy,iz,ispin,io,ik,im))
           ztmp = ztmp + stencil%coef_nab(1,3) * cpsi * psi%zwf(ix,iy,mg%idz(iz+1),ispin,io,ik,im) &
                       + stencil%coef_nab(2,3) * cpsi * psi%zwf(ix,iy,mg%idz(iz+2),ispin,io,ik,im) &
                       + stencil%coef_nab(3,3) * cpsi * psi%zwf(ix,iy,mg%idz(iz+3),ispin,io,ik,im) &

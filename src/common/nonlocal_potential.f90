@@ -718,6 +718,15 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
       ! definitely-padding cell for atom 1 directly (mps(1)=960 < nps=968).
       write(*,'(A,2ES16.8)') 'GEMM_DEBUG padding_check gemm_wf_packed(965,1,1) (should be 0,0) =', &
           gemm_wf_packed(965,1,1)
+
+      ! gemm_zekr_packed/gemm_rinv_packed are also built ONCE at setup and
+      ! never rewritten -- re-verify they still match their source arrays
+      ! at call 50 (same check the setup diagnostic did at call 1), to
+      ! rule out these "constant" arrays drifting/getting corrupted too.
+      write(*,'(A,2ES16.8,A,2ES16.8)') 'GEMM_DEBUG zekr_recheck gemm=',gemm_zekr_packed(1,1,1), &
+          ' src=',ppg%zekr_uV(1,gemm_l2g(1,1),ik_s)
+      write(*,'(A,ES16.8,A,ES16.8)') 'GEMM_DEBUG rinv_recheck gemm=',gemm_rinv_packed(1,1), &
+          ' src=',ppg%rinv_uvu(gemm_l2g(1,1))
     end if
 
     ! Phase 2 (back-projection): completely unchanged from the plain-acc

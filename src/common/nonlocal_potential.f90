@@ -245,7 +245,6 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
   real(8),allocatable,save :: gemm_rinv_packed(:,:)
   complex(8),allocatable,save :: gemm_wf_packed(:,:,:), gemm_out_packed(:,:,:)
   type(cublasHandle),save :: gemm_handle
-  logical,save :: gemm_handle_created = .false.
   integer :: gemm_ia, gemm_p, gemm_ilma, gemm_j, gemm_natom
   integer :: gemm_io_blk_s, gemm_this_block, gemm_io_local, gemm_stat
 #endif
@@ -461,7 +460,6 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
 !$acc enter data copyin(gemm_wf_packed) create(gemm_out_packed)
 
       gemm_stat = cublasCreate(gemm_handle)
-      gemm_handle_created = .true.
     end if
 
     ! cublas must share OpenACC's synchronous stream, or nothing guarantees the GEMM finishes before the scatter kernel reads its output.
@@ -470,7 +468,9 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
     ! Per-call: batched GEMM projection, blocked over bands to bound gemm_wf_packed's memory.
     do im=im_s,im_e
     do ik=ik_s,ik_e
-      ! zekr_uV = exp(-i(k+A/c)r)*uv depends on both k and the time-dependent A(t) (time_evolution_step.f90 advances it every RT step) -- refresh the packed copy once per (call, k-point), keeping the array 3D (no ik dimension) so it's never passed as a slice through host_data/cublas, which triggers an nvfortran ICE.
+      ! zekr_uV = exp(-i(k+A/c)r)*uv depends on k and on the time-dependent A(t), which time_evolution_step.f90 advances every RT step.
+      ! So refresh the packed copy once per (call, k-point) -- packing it only at setup freezes the t=0 phases and silently drifts the physics.
+      ! Kept 3D (no ik dimension) so it is never passed as a slice through host_data/cublas, which triggers an nvfortran ICE.
 !$acc parallel loop collapse(3) present(ppg, gemm_zekr_packed, gemm_l2g, gemm_nproj_atom)
       do gemm_ia = 1, gemm_natom
       do gemm_p = 1, gemm_max_nproj

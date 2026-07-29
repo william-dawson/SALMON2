@@ -441,7 +441,7 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
         gemm_l2g(gemm_nproj_atom(ia), ia) = ilma
       end do
 
-      ! Single k-point only (ik_s=ik_e): gemm_zekr_packed has no ik dimension, refreshed fresh below since it's ik_s-only.
+      ! gemm_zekr_packed has no ik dimension -- refreshed per k-point in the per-call loop below (see there for why).
       allocate(gemm_zekr_packed(ppg%nps, gemm_max_nproj, gemm_natom))
       allocate(gemm_rinv_packed(gemm_max_nproj, gemm_natom))
       gemm_zekr_packed = (0.d0,0.d0)
@@ -464,25 +464,25 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
       gemm_handle_created = .true.
     end if
 
-    ! zekr_uV = exp(-i(k+A/c)r)*uv is rewritten every RT step (time_evolution_step.f90 advances A(t)) -- refresh the packed copy every call, not just once at setup.
-!$acc parallel loop collapse(3) present(ppg, gemm_zekr_packed, gemm_l2g, gemm_nproj_atom)
-    do gemm_ia = 1, gemm_natom
-    do gemm_p = 1, gemm_max_nproj
-    do gemm_j = 1, ppg%nps
-      if (gemm_p <= gemm_nproj_atom(gemm_ia) .and. gemm_j <= ppg%mps(gemm_ia)) then
-        gemm_zekr_packed(gemm_j, gemm_p, gemm_ia) = &
-            ppg%zekr_uV(gemm_j, gemm_l2g(gemm_p, gemm_ia), ik_s)
-      end if
-    end do
-    end do
-    end do
-
     ! cublas must share OpenACC's synchronous stream, or nothing guarantees the GEMM finishes before the scatter kernel reads its output.
     gemm_stat = cublasSetStream(gemm_handle, acc_get_cuda_stream(acc_async_sync))
 
     ! Per-call: batched GEMM projection, blocked over bands to bound gemm_wf_packed's memory.
     do im=im_s,im_e
     do ik=ik_s,ik_e
+      ! zekr_uV = exp(-i(k+A/c)r)*uv depends on both k and the time-dependent A(t) (time_evolution_step.f90 advances it every RT step) -- refresh the packed copy once per (call, k-point), keeping the array 3D (no ik dimension) so it's never passed as a slice through host_data/cublas, which triggers an nvfortran ICE.
+!$acc parallel loop collapse(3) present(ppg, gemm_zekr_packed, gemm_l2g, gemm_nproj_atom)
+      do gemm_ia = 1, gemm_natom
+      do gemm_p = 1, gemm_max_nproj
+      do gemm_j = 1, ppg%nps
+        if (gemm_p <= gemm_nproj_atom(gemm_ia) .and. gemm_j <= ppg%mps(gemm_ia)) then
+          gemm_zekr_packed(gemm_j, gemm_p, gemm_ia) = &
+              ppg%zekr_uV(gemm_j, gemm_l2g(gemm_p, gemm_ia), ik)
+        end if
+      end do
+      end do
+      end do
+
     do ispin=1,Nspin
       gemm_io_blk_s = io_s
       do while (gemm_io_blk_s <= io_e)

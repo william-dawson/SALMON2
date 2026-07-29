@@ -519,18 +519,35 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
       end if
     end if
 
-    ! Rebind cublas to the CURRENT synchronous OpenACC stream on every call,
-    ! not just once at setup. Suspected root cause of the correctness bug
-    ! (electron-count drift starting ~call 50, exhaustively NOT explained
-    ! by wrong values -- setup, padding, zekr, rinv, and a full-Nlma
-    ! coverage sum have all been individually verified correct): NVHPC's
-    ! runtime may not keep "the synchronous queue" pinned to one physical
-    ! CUDA stream for the life of the program, rotating it across the many
-    ! OTHER OpenACC kernel launches elsewhere in SALMON between calls to
-    ! this subroutine. A one-time bind at setup (call 1) would then go
-    ! stale exactly the way observed: correct before any rotation, silently
-    ! wrong once the runtime has moved on to a different physical stream.
     gemm_stat = cublasSetStream(gemm_handle, acc_get_cuda_stream(acc_async_sync))
+
+    ! ROOT CAUSE of the electron-count/energy drift: ppg%zekr_uV is NOT
+    ! constant during an RT run. structures.f90 documents it as
+    ! zekr_uV = exp(-i(k+A/c)r)*uv, and time_evolution_step.f90 sets
+    ! system%vec_Ac to the current step's vector potential and then calls
+    ! update_kvector_nonlocalpt() -- which rewrites the whole array -- on
+    ! EVERY time step. Packing it once at setup therefore freezes the t=0
+    ! phase factors while the rest of the code advances with A(t), so the
+    ! GEMM's projectors drift further out of date the longer the run goes.
+    ! That matches every observation: exact at call 1, ~0.2% off by call
+    ! 50, and a monotonically growing electron-count error.
+    !
+    ! Refresh the packed copy every call, on the device. Only zekr needs
+    ! this: rinv_uvu is a genuine time-independent normalization (verified
+    ! unchanged at call 50), and l2g/nproj_atom are pure topology. Padding
+    ! rows stay untouched (and therefore still zero) because the guard
+    ! only ever writes the valid (p,j) sub-region.
+!$acc parallel loop collapse(3) present(ppg, gemm_zekr_packed, gemm_l2g, gemm_nproj_atom)
+    do gemm_ia = 1, gemm_natom
+    do gemm_p = 1, gemm_max_nproj
+    do gemm_j = 1, ppg%nps
+      if (gemm_p <= gemm_nproj_atom(gemm_ia) .and. gemm_j <= ppg%mps(gemm_ia)) then
+        gemm_zekr_packed(gemm_j, gemm_p, gemm_ia) = &
+            ppg%zekr_uV(gemm_j, gemm_l2g(gemm_p, gemm_ia), ik_s)
+      end if
+    end do
+    end do
+    end do
 
     ! --- per-call: batched GEMM projection, blocked over bands ---
     do im=im_s,im_e

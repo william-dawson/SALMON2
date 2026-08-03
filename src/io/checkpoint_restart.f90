@@ -486,7 +486,6 @@ subroutine read_bin(idir,lg,mg,system,info,spsi,iter,mixing,Vh_stock1,Vh_stock2,
      call comm_bcast(itt,comm)
      call comm_bcast(nprocs,comm)
      call comm_bcast(if_real_orbital,comm)
-     system%if_real_orbital = if_real_orbital
 
      if((theory=='dft'.or.theory=='dft_band'.or.calc_mode=='GS').or.  &
         ((theory=='tddft_response'.or.theory=='tddft_pulse'.or.calc_mode=='RT').and.yn_restart=='y'))then

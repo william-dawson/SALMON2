@@ -150,6 +150,7 @@ subroutine init_dft_system(lg,system,stencil)
     hgs(1:3) = dl(1:3)
   end if
   call init_grid_whole(rsize,hgs,lg)
+  num_rgrid = lg%num
   system%hgs = hgs
   system%ngrid = lg%num(1) * lg%num(2) * lg%num(3)
 

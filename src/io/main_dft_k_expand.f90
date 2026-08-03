@@ -127,22 +127,23 @@ subroutine main_dft_k_expand_single
   call init_dir_out_restart(ofl)
   allocate(wdir(kex%nk))
   call generate_restart_directory_name_k_expand(kex,ofl%dir_out_restart,gdir,wdir)
-  do ik=1,kex%nk
-    !write(*,*) trim(wdir(ik))
-     call create_directory(wdir(ik))
-  enddo
+  call create_directory(gdir)
 
-  do ik=1,kex%nk
-     if(kex%myrank(ik)==0) then
-        wdir0 = wdir(ik)
-        call write_info_bin(     wdir0,kex,system,Miter)
-        call write_atomic_coor(  wdir0,kex,system)
-        call write_atomic_vel(   wdir0,kex,system)
-        call write_occ_bin(      wdir0,kex,system)
-     endif
-  enddo
-  call write_rho_inout_bin(wdir0,kex,system,lg,mg,info,mixing)
-  call write_wfn_bin(wdir,kex,system,spsi,lg,mg,info,mixing)
+  ! Set expanded system dimensions on all ranks (needed by write_wfn_bin)
+  kex%nk_new = 1
+  kex%no_new = system%no * kex%nk
+
+  ! Write all metadata to the top-level directory (single shared file format,
+  ! not per-rank self-checkpoint format) so that a subsequent TDDFT run with
+  ! yn_restart='n' and method_wf_distributor='single' can read it back.
+  if(comm_is_root(nproc_id_global)) then
+     call write_info_bin(     gdir,kex,system,Miter)
+     call write_atomic_coor(  gdir,kex,system)
+     call write_atomic_vel(   gdir,kex,system)
+     call write_occ_bin(       gdir,kex,system)
+  endif
+  call write_rho_inout_bin(gdir,kex,system,lg,mg,info,mixing)
+  call write_wfn_bin(gdir,kex,system,spsi,lg,mg,info,mixing)
 
 
   !(log)
@@ -158,7 +159,7 @@ subroutine main_dft_k_expand_single
      write(*,'(a)')         "    process_allocation = orbital_sequential"
      write(*,'(a, i6)')     "    nproc_k  =" , kex%nk_new
      write(*,'(a, i6)')     "    nproc_ob =" , nproc_ob * kex%nk
-     write(*,'(a,3i6)')     "    nproc_rgrid =", nproc_rgrid(1)*kex%nkx, nproc_rgrid(1)*kex%nky, nproc_rgrid(2)*kex%nkz
+      write(*,'(a,3i6)')     "    nproc_rgrid =", nproc_rgrid(1)*kex%nkx, nproc_rgrid(2)*kex%nky, nproc_rgrid(3)*kex%nkz
   endif
 
 
@@ -342,10 +343,10 @@ subroutine get_print_rank_numbers(kex,info)
     character(256),intent(out) :: pdir(kex%nk)
     integer :: ik, nproc_id_kex
 
-    ! global directory
-    write(gdir,'(A,I6.6,A)')   trim(basedir)
+    ! global directory (the restart directory itself)
+    gdir = trim(basedir)
 
-    ! process private directory for k-expand
+    ! process private directory for k-expand (kept for compatibility)
     do ik=1,kex%nk
        nproc_id_kex = kex%myrank(ik)
        write(pdir(ik),'(A,A,I6.6,A)') trim(gdir),'rank_',nproc_id_kex,'/'
@@ -450,7 +451,7 @@ subroutine get_print_rank_numbers(kex,info)
     type(s_dft_system) :: system
     character(*)    :: odir
     character(1024) :: dir_file_out
-    integer :: iu1, io,ik, io_new
+    integer :: iu1, io,ik, io_occ, io_empty
     real(8),allocatable :: rocc_new(:,:,:)
 
     iu1 = 91
@@ -460,12 +461,22 @@ subroutine get_print_rank_numbers(kex,info)
     allocate(rocc_new(1:kex%no_new, 1:kex%nk_new, 1:system%nspin))
 
     rocc_new(:,:,:) = 0d0
-    io_new=0
-    do io=1,system%no
+    io_occ=0
+    io_empty=0
     do ik=1,kex%nk
-       io_new = io_new + 1
-       rocc_new(io_new,1,nspin) = system%rocc(io,ik,nspin)
-      !write(*,*) "rocc", io_new, rocc_new(io_new,1,nspin)
+    do io=1,system%no
+       if (system%rocc(io,ik,nspin) > 0.5d0) then
+          io_occ = io_occ + 1
+          rocc_new(io_occ,1,nspin) = system%rocc(io,ik,nspin)
+       endif
+    enddo
+    enddo
+    do ik=1,kex%nk
+    do io=1,system%no
+       if (system%rocc(io,ik,nspin) <= 0.5d0) then
+          io_empty = io_empty + 1
+          rocc_new(io_occ + io_empty,1,nspin) = system%rocc(io,ik,nspin)
+       endif
     enddo
     enddo
     write(iu1) rocc_new(1:kex%no_new,1:kex%nk_new,1:system%nspin)
@@ -473,7 +484,7 @@ subroutine get_print_rank_numbers(kex,info)
 
   deallocate(rocc_new)
 
-end subroutine write_occ_bin
+  end subroutine write_occ_bin
 
 subroutine write_rho_inout_bin(odir,kex,system,lg,mg,info,mixing)
   implicit none
@@ -603,6 +614,8 @@ subroutine write_rho_inout_bin(odir,kex,system,lg,mg,info,mixing)
 end subroutine write_rho_inout_bin
 
 subroutine write_wfn_bin(odir,kex,system,spsi,lg,mg,info,mixing)
+  use mpi
+  use parallelization, only: nproc_id_global, nproc_group_global
   implicit none
   type(s_k_expand) :: kex
   type(s_dft_system) :: system
@@ -610,111 +623,124 @@ subroutine write_wfn_bin(odir,kex,system,spsi,lg,mg,info,mixing)
   type(s_rgrid) :: lg,mg
   type(s_parallel_info) :: info
   type(s_mixing)  :: mixing
-  character(*)    :: odir(kex%nk)
-  character(1024) :: dir_file_out    !,ofile_cube
- !real(8) :: tmp_norm(system%nk,system%no), norm_all(system%nk,system%no)
-  real(8) :: scale, rshift(3), r(3)  !,norm
-  integer :: ix_add, iy_add, iz_add  !,mx,my,mz
-  integer :: iu,id,ip_x,ip_y,ip_z, inkx,inky,inkz, ip_o,ip_k
-  integer :: im,ik,is,ix,iy,iz,iix,iiy,iiz !, io
- !real(8),allocatable :: orb_real(:,:,:)
+  character(*)    :: odir
+  character(1024) :: dir_file_out
+  real(8) :: scale, rshift(3), r(3)
+  integer :: ix_add, iy_add, iz_add, itile
+  integer :: im,ik,is,ix,iy,iz,iix,iiy,iiz
+  integer :: nx_new, ny_new, nz_new, nx_gs, ny_gs, nz_gs
+  integer :: n_occ_per_k, n_empty_per_k, n_occ_total
+  integer :: io_occ_s, io_occ_e, numo_occ, io_global_occ
+  integer :: io_empty_s, io_empty_e, numo_empty, io_global_empty
+  integer :: gsize(7), lsize(7), lstart(7)
+  integer :: global_type, mfile, ierr
   complex(8) :: ai,ekr
   complex(8),allocatable :: zwf_ekr(:,:,:,:)
 
-  !!check norm -> later normalize to improbe accuracy
-  !im = 1
-  !is = 1 
-  !tmp_norm(system%nk,system%no) = 0d0
-  !
-  !do ik= info%ik_s,info%ik_e
-  !do io= info%io_s,info%io_e
-  !    tmp_norm(ik,io) = sum(abs(spsi%zwf(mg%is(1):mg%ie(1),mg%is(2):mg%ie(2),mg%is(3):mg%ie(3),is,io,ik,im))**2)
-  !enddo
-  !enddo
-  !
-  !call comm_summation(tmp_norm,norm_all,system%nk*system%no,info%icomm_r)
-  !
-  !do ik= info%ik_s,info%ik_e
-  !do io= info%io_s,info%io_e
-  !   norm_all(ik,io) = norm_all(ik,io) * system%hvol
-  !   scale = 1d0/sqrt(norm_all(ik,io))
-  !   write(*,'(a,2i6,f20.12)') "norm of orbital   ", ik,io, norm_all(ik,io)
-  !   spsi%zwf(mg%is(1):mg%ie(1),mg%is(2):mg%ie(2),mg%is(3):mg%ie(3),is,io,ik,im)= &
-  !   spsi%zwf(mg%is(1):mg%ie(1),mg%is(2):mg%ie(2),mg%is(3):mg%ie(3),is,io,ik,im)*scale
-  !enddo
-  !enddo
-!--------------------
-
   ai        = ( 0d0, 1d0 )
-  rshift(:) = -system%hgs(:)    !probably only if(yn_domain_parallel=='y')
+  rshift(:) = -system%hgs(:)
   scale = 1d0/sqrt(dble(kex%nk))
+
+  nx_new = lg%num(1) * kex%nkx
+  ny_new = lg%num(2) * kex%nky
+  nz_new = lg%num(3) * kex%nkz
+  nx_gs  = lg%ie(1) - lg%is(1) + 1
+  ny_gs  = lg%ie(2) - lg%is(2) + 1
+  nz_gs  = lg%ie(3) - lg%is(3) + 1
+
+  n_occ_per_k   = count(system%rocc(:,1,1) > 0.5d0)
+  n_empty_per_k = system%no - n_occ_per_k
+  n_occ_total   = kex%nk * n_occ_per_k
 
   allocate( zwf_ekr(mg%is(1):mg%ie(1),mg%is(2):mg%ie(2),mg%is(3):mg%ie(3),info%io_s:info%io_e) )
 
-  do id =1,kex%nk
+  dir_file_out = trim(odir)//"/wfn.bin"
+  call MPI_File_open(nproc_group_global, trim(dir_file_out), &
+                     IOR(MPI_MODE_WRONLY, MPI_MODE_CREATE), &
+                     MPI_INFO_NULL, mfile, ierr)
+  if (ierr /= MPI_SUCCESS) stop "write_wfn_bin: MPI_File_open failed"
 
-     ![i1,k1,i2,k2,i3,k3,i4,i5]
-     ip_x = kex%iaddress(1,id)
-     inkx = kex%iaddress(2,id)
-     ip_y = kex%iaddress(3,id)
-     inky = kex%iaddress(4,id)
-     ip_z = kex%iaddress(5,id)
-     inkz = kex%iaddress(6,id)
-     ip_o = kex%iaddress(7,id)
-     ip_k = kex%iaddress(8,id)
+  if(info%im_s /= info%im_e) stop "error im_s /= im_e"
+  if(info%ik_s /= info%ik_e) stop "error ik_s /= ik_e"
 
-     !now assuming ik_s=ik_e, im_s=im_e, nspin=1
-     if(info%im_s /= info%im_e) stop "error im_s /= im_e"
-     if(info%ik_s /= info%ik_e) stop "error ik_s /= ik_e"
+  im = info%im_s
+  ik = info%ik_s
+  is = 1
 
-     im = info%im_s
-     ik = info%ik_s
-     is = 1 
+  io_occ_s   = info%io_s
+  io_occ_e   = min(info%io_e, n_occ_per_k)
+  numo_occ   = io_occ_e - io_occ_s + 1
 
-     iu = 1000 + kex%myrank(id)
-     dir_file_out = trim(odir(id))//"/wfn.bin"
-     open(iu,file=dir_file_out,form='unformatted',access='stream')
+  io_empty_s = max(info%io_s, n_occ_per_k + 1)
+  io_empty_e = info%io_e
+  numo_empty = io_empty_e - io_empty_s + 1
 
-     ix_add = (lg%ie(1)-lg%is(1)+1) * (inkx-1)
-     iy_add = (lg%ie(2)-lg%is(2)+1) * (inky-1)
-     iz_add = (lg%ie(3)-lg%is(3)+1) * (inkz-1)
+  gsize = [nx_new, ny_new, nz_new, 1, kex%no_new, 1, 1]
+
+  do itile = 1, kex%nk
+
+     ix_add = nx_gs * (kex%isupercell(1,itile) - 1)
+     iy_add = ny_gs * (kex%isupercell(2,itile) - 1)
+     iz_add = nz_gs * (kex%isupercell(3,itile) - 1)
 
      do iz = mg%is(3), mg%ie(3)
         iiz = iz + iz_add
         r(3) = iiz*system%hgs(3) + rshift(3)
-
         do iy = mg%is(2), mg%ie(2)
            iiy = iy + iy_add
            r(2) = iiy*system%hgs(2) + rshift(2)
-
            do ix = mg%is(1), mg%ie(1)
               iix = ix + ix_add
               r(1) = iix*system%hgs(1) + rshift(1)
-
               ekr = exp(ai * sum(kex%k_vec(:,ik)*r(:)) ) * scale
               zwf_ekr(ix,iy,iz,info%io_s:info%io_e) = &
                      spsi%zwf(ix,iy,iz,is,info%io_s:info%io_e,ik,im)* ekr
-
            enddo
         enddo
      enddo
 
-     !write
-     write(iu) zwf_ekr(mg%is(1):mg%ie(1),mg%is(2):mg%ie(2),mg%is(3):mg%ie(3),info%io_s:info%io_e)
+     if (numo_occ > 0) then
+        io_global_occ = (ik-1)*n_occ_per_k + io_occ_s
+        lsize  = [nx_gs, ny_gs, nz_gs, 1, numo_occ, 1, 1]
+        lstart = [ix_add, iy_add, iz_add, 0, io_global_occ-1, 0, 0]
+        call MPI_Type_create_subarray(7, gsize, lsize, lstart, &
+                                      MPI_ORDER_FORTRAN, MPI_DOUBLE_COMPLEX, global_type, ierr)
+        call MPI_Type_commit(global_type, ierr)
+        call MPI_File_set_view(mfile, 0_MPI_OFFSET_KIND, MPI_DOUBLE_COMPLEX, &
+                               global_type, 'native', MPI_INFO_NULL, ierr)
+        call MPI_File_write_at(mfile, 0_MPI_OFFSET_KIND, &
+               zwf_ekr(mg%is(1),mg%is(2),mg%is(3),io_occ_s), &
+               nx_gs*ny_gs*nz_gs*numo_occ, MPI_DOUBLE_COMPLEX, &
+               MPI_STATUS_IGNORE, ierr)
+        call MPI_Type_free(global_type, ierr)
+     else
+        call MPI_File_set_view(mfile, 0_MPI_OFFSET_KIND, MPI_DOUBLE_COMPLEX, &
+                               MPI_DOUBLE_COMPLEX, 'native', MPI_INFO_NULL, ierr)
+     end if
 
-    ! !for check
-    ! if(ip_o==20) then
-    !    mx=mg%ie(1)
-    !    my=mg%ie(2)
-    !    mz=mg%ie(3)
-    !    allocate(orb_real(mx,my,mz))
-    !    orb_real(1:mx,1:my,1:mz) = real(zwf_ekr(1:mx,1:my,1:mz,ip_o))
-    !    ofile_cube="orb_20.cube"
-    !    call  write_cube(orb_real,mx,my,mz,system%hgs,ofile_cube)
-    ! endif
+     if (numo_empty > 0) then
+        io_global_empty = n_occ_total + (ik-1)*n_empty_per_k + (io_empty_s - n_occ_per_k)
+        lsize  = [nx_gs, ny_gs, nz_gs, 1, numo_empty, 1, 1]
+        lstart = [ix_add, iy_add, iz_add, 0, io_global_empty-1, 0, 0]
+        call MPI_Type_create_subarray(7, gsize, lsize, lstart, &
+                                      MPI_ORDER_FORTRAN, MPI_DOUBLE_COMPLEX, global_type, ierr)
+        call MPI_Type_commit(global_type, ierr)
+        call MPI_File_set_view(mfile, 0_MPI_OFFSET_KIND, MPI_DOUBLE_COMPLEX, &
+                               global_type, 'native', MPI_INFO_NULL, ierr)
+        call MPI_File_write_at(mfile, 0_MPI_OFFSET_KIND, &
+               zwf_ekr(mg%is(1),mg%is(2),mg%is(3),io_empty_s), &
+               nx_gs*ny_gs*nz_gs*numo_empty, MPI_DOUBLE_COMPLEX, &
+               MPI_STATUS_IGNORE, ierr)
+        call MPI_Type_free(global_type, ierr)
+     else
+        call MPI_File_set_view(mfile, 0_MPI_OFFSET_KIND, MPI_DOUBLE_COMPLEX, &
+                               MPI_DOUBLE_COMPLEX, 'native', MPI_INFO_NULL, ierr)
+     end if
 
-     close(iu)
   enddo
+
+  call MPI_Barrier(nproc_group_global, ierr)
+  call MPI_File_close(mfile, ierr)
   if(allocated(zwf_ekr)) deallocate( zwf_ekr )
 
 end subroutine write_wfn_bin

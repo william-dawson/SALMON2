@@ -186,6 +186,7 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
   type(s_orbital) :: htpsi
   !
   integer :: ispin,io,ik,im,im_s,im_e,ik_s,ik_e,io_s,io_e
+  complex(8),allocatable,save :: uVpsi_phase1(:,:,:,:,:)
   integer :: ilma,ia,j,ix,iy,iz,Nlma,ilocal,vi,my_nlma,k
   complex(8) :: uVpsi,wrk
   complex(8),allocatable :: uVpsibox (:,:,:,:,:)
@@ -456,14 +457,23 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
 !$acc end kernels
 #endif
 #else
-!$omp parallel do collapse(4) &
-!$omp             private(im,ik,io,ispin,ilma,ia,uVpsi,j,ix,iy,iz,wrk)
+  if (.not. allocated(uVpsi_phase1)) then
+    allocate(uVpsi_phase1(Nlma,Nspin,io_s:io_e,ik_s:ik_e,im_s:im_e))
+  end if
+
+  ! Phase 1 (projection): each (ilma,ispin,io,ik,im) tuple writes a unique
+  ! element of uVpsi_phase1 -- no shared writes at all, so it is always safe
+  ! to parallelize over ilma as well as io. This is what keeps all
+  ! OMP_NUM_THREADS busy even when io_e-io_s+1 (orbitals/rank) is smaller
+  ! than the thread count -- unlike the original fused loop, whose only
+  ! parallel dimension was io.
+!$omp parallel do collapse(5) &
+!$omp             private(im,ik,io,ispin,ilma,ia,uVpsi,j,ix,iy,iz)
     do im=im_s,im_e
     do ik=ik_s,ik_e
     do io=io_s,io_e
     do ispin=1,Nspin
-
-      do ilma=1,Nlma
+    do ilma=1,Nlma
         ia = ppg%ia_tbl(ilma)
         uVpsi = 0.d0
         do j=1,ppg%mps(ia)
@@ -472,13 +482,34 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
           iz = ppg%jxyz(3,j,ia)
           uVpsi = uVpsi + conjg(ppg%zekr_uV(j,ilma,ik)) * tpsi%zwf(ix,iy,iz,ispin,io,ik,im)
         end do
-        uVpsi = uVpsi * ppg%rinv_uvu(ilma)
+        uVpsi_phase1(ilma,ispin,io,ik,im) = uVpsi * ppg%rinv_uvu(ilma)
+    end do
+    end do
+    end do
+    end do
+    end do
+!$omp end parallel do
+
+  ! Phase 2 (scatter/back-projection): unchanged from the original -- still
+  ! parallel over io only, still serial over ilma within a thread. Adjacent
+  ! atoms' projector-support grid points can overlap in space, so htpsi%zwf's
+  ! += here is not safe to parallelize over ilma without an explicit
+  ! reduction or atomic; left as-is pending a follow-up pass.
+!$omp parallel do collapse(4) &
+!$omp             private(im,ik,io,ispin,ilma,ia,j,ix,iy,iz,wrk)
+    do im=im_s,im_e
+    do ik=ik_s,ik_e
+    do io=io_s,io_e
+    do ispin=1,Nspin
+
+      do ilma=1,Nlma
+        ia = ppg%ia_tbl(ilma)
 !OCL norecurrence
         do j=1,ppg%mps(ia)
           ix = ppg%jxyz(1,j,ia)
           iy = ppg%jxyz(2,j,ia)
           iz = ppg%jxyz(3,j,ia)
-          wrk = uVpsi * ppg%zekr_uV(j,ilma,ik)
+          wrk = uVpsi_phase1(ilma,ispin,io,ik,im) * ppg%zekr_uV(j,ilma,ik)
           htpsi%zwf(ix,iy,iz,ispin,io,ik,im) = htpsi%zwf(ix,iy,iz,ispin,io,ik,im) + wrk
         end do
       end do

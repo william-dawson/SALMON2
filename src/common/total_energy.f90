@@ -673,7 +673,7 @@ CONTAINS
   
       call timer_begin(LOG_EIGEN_ENERGY_CALC)
 #ifdef USE_OPENACC
-!$acc kernels loop collapse(3) private(ik,io,ispin) copy(wrk1)
+!$acc kernels loop collapse(3) private(ik,io,ispin)
 #else
 !$omp parallel do collapse(3) default(none) &
 !$omp          private(ik,io,ispin) &

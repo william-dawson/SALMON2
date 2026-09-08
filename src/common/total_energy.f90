@@ -546,7 +546,10 @@ CONTAINS
     !
     integer :: ik,io,ispin,im,nk,no,is(3),ie(3),Nspin
     real(8) :: E_tmp,E_local(2),E_sum(2)
-    real(8),allocatable :: wrk1(:,:,:),wrk2(:,:,:)
+    ! wrk1/wrk2 persist across calls; only this rank's own io-range is
+    ! ever written, so the rest stays zero after the one-time init below
+    real(8),allocatable,save :: wrk1(:,:,:),wrk2(:,:,:)
+    logical,save :: wrk_allocated = .false.
     call nvtxStartRange('calc_eigen_energy', __LINE__)
     call timer_begin(LOG_EIGEN_ENERGY_CALC)
     if(info%im_s/=1 .or. info%im_e/=1) stop "error: calc_eigen_energy"
@@ -557,8 +560,11 @@ CONTAINS
     ie = mg%ie
     no = system%no
     nk = system%nk
-    allocate(wrk1(nspin,no,nk),wrk2(nspin,no,nk))
-    wrk1 = 0d0
+    if (.not. wrk_allocated) then
+      allocate(wrk1(nspin,no,nk),wrk2(nspin,no,nk))
+      wrk1 = 0d0
+      wrk_allocated = .true.
+    end if
     call timer_end(LOG_EIGEN_ENERGY_CALC)
 
     call timer_begin(LOG_EIGEN_ENERGY_HPSI)
@@ -567,9 +573,8 @@ CONTAINS
 
     if(allocated(tpsi%rwf)) then
       if(yn_spinorbit=='y') stop "yn_spinorbit=='y' & real wavefunction"
-      
+
       call timer_begin(LOG_EIGEN_ENERGY_CALC)
-      wrk1 = 0d0
 #ifdef USE_OPENACC
 !$acc parallel loop collapse(3) private(ik,io,ispin)
 #else
@@ -667,7 +672,6 @@ CONTAINS
     ! eigen energies (esp)
   
       call timer_begin(LOG_EIGEN_ENERGY_CALC)
-      wrk1 = 0d0
 #ifdef USE_OPENACC
 !$acc kernels loop collapse(3) private(ik,io,ispin) copy(wrk1)
 #else
@@ -799,7 +803,6 @@ CONTAINS
       energy%E_ion_nloc = energy%E_ion_nloc - system%xc_payload%e_tau
     end if
 
-    deallocate(wrk1,wrk2)
     call nvtxEndRange
     return
   End Subroutine calc_eigen_energy

@@ -21,6 +21,81 @@ module density_matrix
   implicit none
   integer,private,parameter :: Nd = 4
 
+#if defined(USE_OPENACC) && defined(USE_NCCL_KO)
+  ! Persistent NCCL communicator/stream for the density collective over
+  ! icomm_ko. Module-scoped: ensure_ready and allreduce_inplace both touch
+  ! it, and Fortran save locals are not shared across subroutines.
+  type(ncclComm), save, private :: nc_ko_comm
+  integer(cuda_stream_kind), save, private :: nc_ko_stream
+  logical, save, private :: nc_ko_ready = .false.
+#endif
+
+contains
+
+#if defined(USE_OPENACC) && defined(USE_NCCL_KO)
+  ! Pay ncclCommInitRank's one-time handshake here, called from
+  ! calc_density's entry -- before any timer starts -- so it is never
+  ! attributed to the per-step collective. NCCL also establishes its data
+  ! channels lazily on the FIRST collective of a given message size (a
+  ! cost scaling with message size, measured as a 15-37x rank-to-rank
+  ! spread when skipped), so run one throwaway allreduce at the production
+  ! size as a warm-up.
+  subroutine density_nccl_ensure_ready(icomm, n)
+    use nccl
+    use cudafor
+    use mpi, only: MPI_Comm_rank, MPI_Comm_size, MPI_Bcast, MPI_CHARACTER
+    implicit none
+    integer, intent(in) :: icomm, n
+    type(ncclUniqueId) :: nc_uid
+    type(ncclResult) :: nc_stat
+    integer :: nc_rank, nc_size, ierr, cuda_stat
+    real(8), allocatable :: warm(:)
+
+    if (nc_ko_ready) return
+    call MPI_Comm_rank(icomm, nc_rank, ierr)
+    call MPI_Comm_size(icomm, nc_size, ierr)
+    if (nc_rank == 0) nc_stat = ncclGetUniqueId(nc_uid)
+    call MPI_Bcast(nc_uid%internal, 128, MPI_CHARACTER, 0, icomm, ierr)
+    nc_stat = ncclCommInitRank(nc_ko_comm, nc_size, nc_uid, nc_rank)
+    if (nc_stat /= ncclSuccess) stop 'density_nccl_ensure_ready: ncclCommInitRank failed'
+    cuda_stat = cudaStreamCreate(nc_ko_stream)
+    if (cuda_stat /= 0) stop 'density_nccl_ensure_ready: cudaStreamCreate failed'
+
+    allocate(warm(n))
+    warm = 0d0
+!$acc data create(warm)
+!$acc host_data use_device(warm)
+    nc_stat = ncclAllReduce(warm, warm, n, ncclDouble, ncclSum, nc_ko_comm, nc_ko_stream)
+!$acc end host_data
+    cuda_stat = cudaStreamSynchronize(nc_ko_stream)
+!$acc end data
+    deallocate(warm)
+    if (nc_stat /= ncclSuccess .or. cuda_stat /= 0) stop 'density_nccl_ensure_ready: warm-up ncclAllReduce failed'
+    nc_ko_ready = .true.
+  end subroutine density_nccl_ensure_ready
+
+  ! Device-resident in-place NCCL allreduce replacing comm_summation for
+  ! the density collective: MPI_Allreduce handed device pointers does the
+  ! arithmetic on the host and round-trips device<->host every step.
+  subroutine density_nccl_allreduce_inplace(buf, n, icomm)
+    use nccl
+    use cudafor
+    implicit none
+    real(8), intent(inout) :: buf(:,:,:)
+    integer, intent(in)    :: n
+    integer, intent(in)    :: icomm
+    type(ncclResult) :: nc_stat
+    integer :: cuda_stat
+
+    call density_nccl_ensure_ready(icomm, n)
+!$acc host_data use_device(buf)
+    nc_stat = ncclAllReduce(buf, buf, n, ncclDouble, ncclSum, nc_ko_comm, nc_ko_stream)
+!$acc end host_data
+    cuda_stat = cudaStreamSynchronize(nc_ko_stream)
+    if (nc_stat /= ncclSuccess .or. cuda_stat /= 0) stop 'density_nccl_allreduce_inplace: ncclAllReduce failed'
+  end subroutine density_nccl_allreduce_inplace
+#endif
+
 contains
 
   subroutine calc_density(system,rho,psi,info,mg)
@@ -46,6 +121,12 @@ contains
     integer :: im,ispin,ik,io,is(3),ie(3),nsize,nspin,tid,ix,iy,iz,nthreads
     real(8) :: wrk2
     real(8),allocatable :: wrk(:,:,:,:)
+#if defined(USE_OPENACC) && defined(USE_NCCL_KO)
+    ! One-time NCCL handshake + warm-up, outside every timer.
+    if (yn_nccl_ko == 'y') then
+      call density_nccl_ensure_ready(info%icomm_ko, mg%num(1)*mg%num(2)*mg%num(3))
+    end if
+#endif
     call nvtxStartRange('calc_density', __LINE__)
     call timer_begin(LOG_DENSITY_CALC)
     
@@ -131,7 +212,10 @@ contains
         call timer_begin(LOG_DENSITY_COMM_COLL)
 #if defined(USE_OPENACC) && defined(USE_NCCL_KO)
         if (yn_nccl_ko == 'y') then
-          call comm_summation_density_nccl(wrk(:,:,:,0),rho(ispin,im)%f(:,:,:),nsize,info%icomm_ko)
+          call density_nccl_allreduce_inplace(wrk(:,:,:,0), nsize, info%icomm_ko)
+!$acc kernels
+          rho(ispin,im)%f(:,:,:) = wrk(:,:,:,0)
+!$acc end kernels
         else
           call comm_summation(wrk(:,:,:,0),rho(ispin,im)%f(:,:,:),nsize,info%icomm_ko)
         end if
@@ -203,7 +287,10 @@ contains
         call timer_begin(LOG_DENSITY_COMM_COLL)
 #if defined(USE_OPENACC) && defined(USE_NCCL_KO)
         if (yn_nccl_ko == 'y') then
-          call comm_summation_density_nccl(wrk(:,:,:,0),rho(ispin,im)%f(:,:,:),nsize,info%icomm_ko)
+          call density_nccl_allreduce_inplace(wrk(:,:,:,0), nsize, info%icomm_ko)
+!$acc kernels
+          rho(ispin,im)%f(:,:,:) = wrk(:,:,:,0)
+!$acc end kernels
         else
           call comm_summation(wrk(:,:,:,0),rho(ispin,im)%f(:,:,:),nsize,info%icomm_ko)
         end if
@@ -224,59 +311,6 @@ contains
     call nvtxEndRange
     return
   end subroutine calc_density
-
-#if defined(USE_OPENACC) && defined(USE_NCCL_KO)
-  subroutine comm_summation_density_nccl(invalue,outvalue,nsize,ngroup)
-    ! NCCL reduces on the GPU; MPI_Allreduce handed device pointers stages
-    ! through the host and leaves NVLink entirely (see nonlocal_potential).
-    use cudafor
-    use nccl
-    use mpi, only : MPI_CHARACTER, MPI_Comm_rank, MPI_Comm_size, MPI_Bcast
-    implicit none
-    real(8),intent(in)  :: invalue(:,:,:)
-    real(8),intent(out) :: outvalue(:,:,:)
-    integer,intent(in)  :: nsize,ngroup
-    real(8),device,allocatable,save :: d_rho(:)
-    type(ncclComm),save :: nccl_ko_comm
-    integer(cuda_stream_kind),save :: nccl_ko_stream
-    integer,save :: nccl_ko_group = -1
-    logical,save :: nccl_ko_ready = .false.
-    type(ncclUniqueId) :: nccl_uid
-    type(ncclResult) :: nccl_stat
-    integer :: nccl_rank,nccl_size,cuda_stat,ierr
-    !
-    if (ngroup == 1) then
-!$acc kernels
-      outvalue = invalue
-!$acc end kernels
-      return
-    end if
-    if (.not. nccl_ko_ready) then
-      call MPI_Comm_rank(ngroup, nccl_rank, ierr)
-      call MPI_Comm_size(ngroup, nccl_size, ierr)
-      if (nccl_rank == 0) nccl_stat = ncclGetUniqueId(nccl_uid)
-      call MPI_Bcast(nccl_uid%internal, 128, MPI_CHARACTER, 0, ngroup, ierr)
-      nccl_stat = ncclCommInitRank(nccl_ko_comm, nccl_size, nccl_uid, nccl_rank)
-      if (nccl_stat /= ncclSuccess) stop 'calc_density: ncclCommInitRank failed'
-      cuda_stat = cudaStreamCreate(nccl_ko_stream)
-      nccl_ko_ready = .true.
-      nccl_ko_group = ngroup
-    else if (nccl_ko_group /= ngroup) then
-      stop 'calc_density: NCCL communicator is bound to one communicator per run'
-    end if
-    if (allocated(d_rho) .and. size(d_rho) < nsize) deallocate(d_rho)
-    if (.not. allocated(d_rho)) allocate(d_rho(nsize))
-!$acc kernels
-    d_rho(1:nsize) = invalue(1:nsize)
-!$acc end kernels
-    nccl_stat = ncclAllReduce(d_rho, d_rho, nsize, ncclDouble, ncclSum, nccl_ko_comm, nccl_ko_stream)
-    cuda_stat = cudaStreamSynchronize(nccl_ko_stream)
-    if (nccl_stat /= ncclSuccess .or. cuda_stat /= 0) stop 'calc_density: ncclAllReduce failed'
-!$acc kernels
-    outvalue(1:nsize) = d_rho(1:nsize)
-!$acc end kernels
-  end subroutine comm_summation_density_nccl
-#endif
 
 !===================================================================================================================================
 

@@ -18,6 +18,10 @@
 #include "config.h"
 
 module density_matrix
+#if defined(USE_OPENACC) && defined(USE_NCCL_KO)
+  use nccl
+  use cudafor
+#endif
   implicit none
   integer,private,parameter :: Nd = 4
 

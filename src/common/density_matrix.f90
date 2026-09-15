@@ -100,8 +100,6 @@ contains
   end subroutine density_nccl_allreduce_inplace
 #endif
 
-contains
-
   subroutine calc_density(system,rho,psi,info,mg)
     use structures
     use communication, only: comm_summation

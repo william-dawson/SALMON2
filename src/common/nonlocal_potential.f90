@@ -192,6 +192,7 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
   complex(8),allocatable :: uVpsibox2(:,:,:,:,:)
 #ifdef USE_OPENACC
   real(8),allocatable,save :: htpsi_zwf_r(:,:,:,:,:,:,:), htpsi_zwf_i(:,:,:,:,:,:,:)
+  complex(8),allocatable,save :: uVpsibox_acc(:,:,:,:,:)
   integer :: i1, i2, i3, i4, i5, i6, i7
   integer :: mps_max
   real(8) :: wrk_r
@@ -403,7 +404,20 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
         ppg%rinv_uvu,&
         tpsi%zwf)
 #else
-!$acc kernels present(ppg,tpsi,htpsi)
+! Scratch for the projection coefficients, shared between the two loop nests below.
+! Allocated once and reused: at production sizes this is O(100 MB), and under
+! -gpu=managed a per-call allocate would hit the CUDA managed allocator every hpsi.
+    if (allocated(uVpsibox_acc)) then
+      if (size(uVpsibox_acc) /= Nlma*Nspin*(io_e-io_s+1)*(ik_e-ik_s+1)*(im_e-im_s+1)) then
+!$acc exit data delete(uVpsibox_acc)
+        deallocate(uVpsibox_acc)
+      end if
+    end if
+    if (.not. allocated(uVpsibox_acc)) then
+      allocate(uVpsibox_acc(Nlma,Nspin,io_s:io_e,ik_s:ik_e,im_s:im_e))
+!$acc enter data create(uVpsibox_acc)
+    end if
+!$acc kernels present(ppg,tpsi,htpsi,uVpsibox_acc)
 !$acc loop collapse(5) independent gang private(ilocal,ilma,ia,uVpsi,vi,my_nlma,k,j,ix,iy,iz,wrk)
     do im=im_s,im_e
     do ik=ik_s,ik_e
@@ -419,7 +433,7 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
           iz = ppg%jxyz(3,j,ia)
           uVpsi = uVpsi + conjg(ppg%zekr_uV(j,ilma,ik)) * tpsi%zwf(ix,iy,iz,ispin,io,ik,im)
         end do
-        ppg%uVpsibox(ilma,ispin,io,ik,im) = uVpsi * ppg%rinv_uvu(ilma)
+        uVpsibox_acc(ilma,ispin,io,ik,im) = uVpsi * ppg%rinv_uvu(ilma)
       end do
 #ifdef USE_OPENACC
     end do
@@ -441,7 +455,7 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
         do k=1,my_nlma
           ilma = ppg%k2ilma(vi,k)
           j    = ppg%k2j(vi,k)
-          wrk  = wrk + ppg%uVpsibox(ilma,ispin,io,ik,im) * ppg%zekr_uV(j,ilma,ik)
+          wrk  = wrk + uVpsibox_acc(ilma,ispin,io,ik,im) * ppg%zekr_uV(j,ilma,ik)
         end do
 
         ix = ppg%v2j(1,vi)

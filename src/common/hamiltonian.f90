@@ -909,14 +909,16 @@ subroutine add_xc_tau_operator(htpsi,tpsi,info,mg,system,stencil,srg)
   real(8),    allocatable :: rgpsi(:,:,:,:)
   real(8),    allocatable :: rgw(:,:,:,:)
   real(8),    allocatable :: rwvec(:,:,:,:)         ! (grid, 3)                    no r-space division
-#ifndef USE_OPENACC
+#if !defined(USE_OPENACC) && !defined(__NVCOMPILER_LLVM__)
   ! 8-dim arrays exceed nvfortran's dimension limit; unused on the abort path below.
   complex(8), allocatable :: uorb(:,:,:,:,:,:,:,:)  ! (grid, nspin,io,ik,im, 3)    r-space division
   real(8),    allocatable :: ruorb(:,:,:,:,:,:,:,:) ! (grid, nspin,io,ik,im, 3)    r-space division
 #endif
 
-#ifdef USE_OPENACC
-  call fail_tau_operator("support is unavailable for OpenACC builds")
+#if defined(USE_OPENACC) || defined(__NVCOMPILER_LLVM__)
+  ! Also unavailable under plain nvfortran: the 8-dim uorb/ruorb arrays this
+  ! body needs exceed its dimension limit regardless of OpenACC.
+  call fail_tau_operator("support is unavailable for this compiler/build")
 #else
   if (.not. system%xc_payload%use_tau_operator) return
   if (.not. allocated(system%xc_payload%vtau%f)) then

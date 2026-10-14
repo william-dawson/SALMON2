@@ -354,6 +354,11 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
   integer :: gemm_io_blk_s, gemm_this_block, gemm_io_local, gemm_stat
   integer :: mpi_ierr
 #endif
+#if defined(USE_OPENACC)
+  integer :: sync_stat
+#endif
+#if defined(USE_OPENACC) && defined(USE_GEMM)
+#endif
 #if defined(USE_OPENACC) && defined(USE_GEMM) && defined(USE_CUDA)
   integer :: zwf_nelem, zwf_s2, zwf_s3, zwf_s4, zwf_s5, zwf_s6, zwf_s7
   integer :: pk_p2, pk_p3, zgather_grid
@@ -891,6 +896,12 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
 #endif
 
   call nvtxEndRange()
+#if defined(USE_OPENACC)
+  ! MEASUREMENT AID (not for upstream): close the phase on the device before
+  ! stopping the clock, so an async CUDA kernel's cost lands inside its own
+  ! region instead of the next one. One sync per phase, not per launch.
+  sync_stat = cudaStreamSynchronize(acc_get_cuda_stream(acc_async_sync))
+#endif
   call timer_end(LOG_UHPSI_PSEUDO)
 
   return

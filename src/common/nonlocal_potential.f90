@@ -22,9 +22,9 @@ module nonlocal_potential
 
 ! WARNING: We must not call these except for hpsi routine.
 
-#if defined(USE_OPENACC) && defined(USE_CUDA)
-  ! Orbitals batched per thread by zphase2_cuda_d. Trades registers for
-  ! independent FMA chains; the host grid sizing below follows it.
+#if defined(USE_OPENACC)
+  ! Orbitals batched per thread by the phase-2 back-projection, CUDA Fortran
+  ! or OpenACC. Trades registers for independent FMA chains.
   integer, parameter :: zphase2_norb = 4
 #endif
 
@@ -355,6 +355,12 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
   integer :: mpi_ierr
 #endif
 #if defined(USE_OPENACC) && defined(USE_GEMM) && defined(USE_CUDA)
+#endif
+#if defined(USE_OPENACC)
+  integer :: ioq, o, nioq_acc
+  complex(8) :: zk, wrkb(zphase2_norb)
+#endif
+#if defined(USE_OPENACC) && defined(USE_GEMM) && defined(USE_CUDA)
   integer :: zwf_nelem, zwf_s2, zwf_s3, zwf_s4, zwf_s5, zwf_s6, zwf_s7
   integer :: pk_p2, pk_p3, zgather_grid
   integer :: ph2_nioq, ph2_nik, ph2_nwork, ph2_grid
@@ -638,28 +644,45 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
           lbound(htpsi%zwf,5), lbound(htpsi%zwf,6), lbound(htpsi%zwf,7), &
           hs_s2, hs_s3, hs_s4, hs_s5, hs_s6, hs_s7)
 #else
+  ! k2ilma/k2j/zekr_uV do not depend on the orbital, so one thread handles
+  ! zphase2_norb of them and each k-iteration's index and projector loads feed
+  ! that many independent FMA chains. Same accumulation order per orbital.
+  nioq_acc = (io_e - io_s + zphase2_norb) / zphase2_norb
 !$acc kernels present(ppg,tpsi,htpsi,uVpsibox_acc)
-!$acc loop collapse(5) independent private(ilocal,ilma,ia,uVpsi,vi,my_nlma,k,j,ix,iy,iz,wrk)
+!$acc loop collapse(4) independent private(ilma,vi,my_nlma,k,j,ix,iy,iz,io,o,ioq,zk,wrkb)
   do im=im_s,im_e
   do ik=ik_s,ik_e
-  do io=io_s,io_e
+  do ioq=0,nioq_acc-1
   do ispin=1,Nspin
     do vi=0,ppg%max_vi-1
       my_nlma = ppg%v2nlma(vi)
       if (my_nlma < 1) cycle
 
-      wrk = 0d0
+!$acc loop seq
+      do o=1,zphase2_norb
+        wrkb(o) = (0d0,0d0)
+      end do
 !$acc loop seq
       do k=1,my_nlma
         ilma = ppg%k2ilma(vi,k)
         j    = ppg%k2j(vi,k)
-        wrk  = wrk + uVpsibox_acc(ilma,ispin,io,ik,im) * ppg%zekr_uV(j,ilma,ik)
+        zk   = ppg%zekr_uV(j,ilma,ik)
+!$acc loop seq
+        do o=1,zphase2_norb
+          io = io_s + ioq*zphase2_norb + o - 1
+          if (io <= io_e) wrkb(o) = wrkb(o) + uVpsibox_acc(ilma,ispin,io,ik,im) * zk
+        end do
       end do
 
       ix = ppg%v2j(1,vi)
       iy = ppg%v2j(2,vi)
       iz = ppg%v2j(3,vi)
-      htpsi%zwf(ix,iy,iz,ispin,io,ik,im) = htpsi%zwf(ix,iy,iz,ispin,io,ik,im) + wrk
+!$acc loop seq
+      do o=1,zphase2_norb
+        io = io_s + ioq*zphase2_norb + o - 1
+        if (io <= io_e) htpsi%zwf(ix,iy,iz,ispin,io,ik,im) = &
+                        htpsi%zwf(ix,iy,iz,ispin,io,ik,im) + wrkb(o)
+      end do
     end do
   end do
   end do

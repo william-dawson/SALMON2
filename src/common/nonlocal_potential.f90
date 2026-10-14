@@ -649,7 +649,7 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
   ! that many independent FMA chains. Same accumulation order per orbital.
   nioq_acc = (io_e - io_s + zphase2_norb) / zphase2_norb
 !$acc kernels present(ppg,tpsi,htpsi,uVpsibox_acc)
-!$acc loop collapse(4) independent private(ilma,vi,my_nlma,k,j,ix,iy,iz,io,o,ioq,zk,wrkb)
+!$acc loop collapse(5) independent private(ilma,my_nlma,k,j,ix,iy,iz,io,o,zk,wrkb)
   do im=im_s,im_e
   do ik=ik_s,ik_e
   do ioq=0,nioq_acc-1

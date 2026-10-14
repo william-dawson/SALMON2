@@ -274,6 +274,7 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
   integer :: gemm_ia, gemm_p, gemm_ilma, gemm_j, gemm_natom
   integer :: gemm_io_blk_s, gemm_this_block, gemm_io_local, gemm_stat
   integer :: mpi_ierr
+  integer :: sync_stat
 #endif
 
 #ifdef FORTRAN_COMPILER_HAS_2MB_ALIGNED_ALLOCATION
@@ -783,6 +784,12 @@ subroutine zpseudo(tpsi,htpsi,info,nspin,ppg)
 #endif
 
   call nvtxEndRange()
+#if defined(USE_OPENACC) && defined(USE_GEMM)
+  ! MEASUREMENT AID (not for upstream): close the phase on the device before
+  ! stopping the clock, so an async kernel's cost lands in its own region.
+  ! One sync per phase, not per launch; a no-op for synchronous OpenACC.
+  sync_stat = cudaStreamSynchronize(acc_get_cuda_stream(acc_async_sync))
+#endif
   call timer_end(LOG_UHPSI_PSEUDO)
 
   return

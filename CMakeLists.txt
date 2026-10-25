@@ -44,7 +44,7 @@ option_set(USE_GEMM      "Use cuBLAS batched-GEMM for pseudo-pt" ON)
 option_set(USE_NCCL      "Use NCCL for the pseudo-pt allreduce"  ON)
 
 # USE_CUDA selects the CUDA kernels: CUDA Fortran for the pseudo-pt gather and
-# back-projection (inside the USE_GEMM path), CUDA C++ for the hpsi stencil.
+# back-projection (inside the USE_GEMM path), CUDA C++ for the hpsi and current stencils.
 if (USE_CUDA AND NOT USE_OPENACC)
   message(FATAL_ERROR "USE_CUDA requires USE_OPENACC")
 endif ()
